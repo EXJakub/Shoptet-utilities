@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -36,7 +37,18 @@ class ShoptetClient:
         self.timeout_s = timeout_s
 
     def _url(self, endpoint: str) -> str:
-        return f"{self.config.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        base_url = self._normalized_base_url()
+        return f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+    def _normalized_base_url(self) -> str:
+        base_url = self.config.base_url.strip()
+        if not base_url:
+            raise ValueError("Shoptet base URL nesmí být prázdné.")
+
+        parsed = urlparse(base_url)
+        if parsed.scheme:
+            return base_url
+        return f"https://{base_url.lstrip('/')}"
 
     def _headers(self) -> dict[str, str]:
         return {

@@ -1,6 +1,7 @@
 import pandas as pd
+import pytest
 
-from shoptet_api import ShoptetConfig, sync_translated_to_sk
+from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
 
 
 class DummyClient:
@@ -58,3 +59,16 @@ def test_sync_translated_to_sk_reports_string_row_index_for_update_error() -> No
     assert missing == 0
     assert report_errors[0]["row_index"] == "product-B"
     assert report_errors[0]["error_type"] == "sk_update_error"
+
+
+def test_shoptet_client_normalizes_base_url_without_scheme() -> None:
+    client = ShoptetClient(ShoptetConfig(base_url="myshop.cz", token="x"))
+
+    assert client._url("/api/products") == "https://myshop.cz/api/products"
+
+
+def test_shoptet_client_rejects_empty_base_url() -> None:
+    client = ShoptetClient(ShoptetConfig(base_url="   ", token="x"))
+
+    with pytest.raises(ValueError, match="nesmí být prázdné"):
+        client._url("/api/products")
