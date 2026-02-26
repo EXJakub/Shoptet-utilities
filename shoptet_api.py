@@ -10,6 +10,14 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _report_row_index(idx: Any) -> int | str:
+    """Return a JSON-serializable row identifier without raising on non-numeric index values."""
+    try:
+        return int(idx)
+    except (TypeError, ValueError):
+        return str(idx)
+
+
 @dataclass(slots=True)
 class ShoptetConfig:
     base_url: str
@@ -110,7 +118,14 @@ def sync_translated_to_sk(
         product_id = sk_index.get(ean)
         if not product_id:
             missing += 1
-            report_errors.append({"row_index": int(idx), "column": ean_field, "error_type": "ean_not_found_on_sk", "message": f"EAN {ean} nebyl nalezen na SK"})
+            report_errors.append(
+                {
+                    "row_index": _report_row_index(idx),
+                    "column": ean_field,
+                    "error_type": "ean_not_found_on_sk",
+                    "message": f"EAN {ean} nebyl nalezen na SK",
+                }
+            )
             continue
 
         payload = {col: row.get(col, "") for col in columns_to_sync if col in translated_df.columns}
@@ -118,5 +133,12 @@ def sync_translated_to_sk(
             sk_client.update_product(product_id, payload)
             updated += 1
         except Exception as exc:
-            report_errors.append({"row_index": int(idx), "column": ean_field, "error_type": "sk_update_error", "message": f"EAN {ean}: {exc}"})
+            report_errors.append(
+                {
+                    "row_index": _report_row_index(idx),
+                    "column": ean_field,
+                    "error_type": "sk_update_error",
+                    "message": f"EAN {ean}: {exc}",
+                }
+            )
     return updated, missing
