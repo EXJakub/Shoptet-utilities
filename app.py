@@ -24,12 +24,17 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-def get_provider(name: str, model: str, use_batch_api: bool) -> TranslationProvider:
+def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_requests: int) -> TranslationProvider:
     if name == "OpenAI":
         api_key = os.getenv("OPENAI_API_KEY", "")
         if not api_key:
             raise ValueError("Chybí OPENAI_API_KEY v .env.")
-        return OpenAIProvider(api_key=api_key, model=model, use_batch_api=use_batch_api)
+        return OpenAIProvider(
+            api_key=api_key,
+            model=model,
+            use_batch_api=use_batch_api,
+            max_parallel_requests=max_parallel_requests,
+        )
     raise ValueError("Zvolený provider není implementovaný.")
 
 
@@ -90,7 +95,12 @@ def _process_batch(
         return
 
     settings: dict[str, Any] = st.session_state.job_settings
-    provider = get_provider(settings["provider_name"], settings["model"], settings["use_batch_api"])
+    provider = get_provider(
+        settings["provider_name"],
+        settings["model"],
+        settings["use_batch_api"],
+        settings["max_parallel_requests"],
+    )
     options = TranslationOptions(**settings["translation_options"])
     glossary: dict[str, str] = settings["glossary"]
     source_lang = settings["source_lang"]
@@ -212,6 +222,15 @@ def main() -> None:
     per_run_cells = st.number_input("Počet buněk na jeden běh (kvůli pause/resume)", min_value=1, max_value=200, value=15, step=1)
     html_mode = st.selectbox("HTML režim", ["AUTO", "FORCE_HTML", "FORCE_TEXT"])
     use_batch_api = st.checkbox("Použít batch API (hromadné volání)", value=False)
+    max_parallel_requests = st.number_input(
+        "Max paralelních OpenAI requestů",
+        min_value=1,
+        max_value=64,
+        value=8,
+        step=1,
+        disabled=use_batch_api,
+        help="Použije se jen při vypnutém batch API.",
+    )
 
     skip_urls = st.checkbox("URL v textu neměnit", value=True)
     skip_emails = st.checkbox("E-maily neměnit", value=True)
@@ -250,7 +269,12 @@ def main() -> None:
             return
 
         try:
-            _ = get_provider(provider_name, model, use_batch_api=use_batch_api)
+            _ = get_provider(
+                provider_name,
+                model,
+                use_batch_api=use_batch_api,
+                max_parallel_requests=int(max_parallel_requests),
+            )
         except Exception as exc:
             st.error(str(exc))
             return
@@ -262,6 +286,7 @@ def main() -> None:
             "target_lang": target_lang,
             "max_chars": int(max_chars),
             "use_batch_api": use_batch_api,
+            "max_parallel_requests": int(max_parallel_requests),
             "keep_unsafe": keep_unsafe,
             "glossary": glossary,
             "per_run_cells": int(per_run_cells),
