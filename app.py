@@ -189,10 +189,13 @@ def main() -> None:
 
     if source_mode == "CSV":
         uploaded = st.file_uploader("Nahraj CSV", type=["csv"])
-        if not uploaded:
-            _job_reset()
+        if uploaded is not None:
+            st.session_state.csv_file_bytes = uploaded.getvalue()
+
+        file_bytes = st.session_state.get("csv_file_bytes")
+        if not file_bytes:
             return
-        file_bytes = uploaded.getvalue()
+
         _, detected_fmt = read_csv_from_upload(file_bytes)
         st.subheader("Detekce vstupu")
         enc = st.selectbox("Encoding", [detected_fmt.encoding, "utf-8-sig", "utf-8"], index=0)
