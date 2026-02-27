@@ -78,6 +78,107 @@ def _chunk_by_char_budget(texts: list[str], target_chars: int = 12000, max_items
         chunks.append(current)
     return chunks
 
+
+
+def _safe_provider_metrics(provider: TranslationProvider) -> dict[str, Any]:
+    getter = getattr(provider, "get_metrics_snapshot", None)
+    if callable(getter):
+        return getter()
+    return {}
+
+
+def _update_job_perf_metrics(
+    provider: TranslationProvider,
+    total_segments: int,
+    cache_misses: int,
+    unique_misses: int,
+) -> None:
+    perf = st.session_state.setdefault(
+        "job_perf",
+        {
+            "segments_total": 0,
+            "cache_misses_total": 0,
+            "unique_misses_total": 0,
+            "chunks_sent": 0,
+            "chunk_target_chars": st.session_state.get("job_chunk_target_chars", 12000),
+            "last_events": [],
+            "http_requests_total": 0,
+            "fallback_count": 0,
+            "error_count": 0,
+            "success_count": 0,
+            "latency_ms_total": 0,
+            "input_chars_total": 0,
+            "input_items_total": 0,
+        },
+    )
+    perf["segments_total"] += total_segments
+    perf["cache_misses_total"] += cache_misses
+    perf["unique_misses_total"] += unique_misses
+
+    metrics = _safe_provider_metrics(provider)
+    if metrics:
+        perf["http_requests_total"] = metrics.get("http_requests_total", 0)
+        perf["fallback_count"] = metrics.get("fallback_count", 0)
+        perf["error_count"] = metrics.get("error_count", 0)
+        perf["success_count"] = metrics.get("success_count", 0)
+        perf["latency_ms_total"] = metrics.get("total_latency_ms", 0)
+        perf["input_chars_total"] = metrics.get("total_input_chars", 0)
+        perf["input_items_total"] = metrics.get("total_input_items", 0)
+        perf["last_events"] = metrics.get("events", [])[-20:]
+
+
+def _autotune_chunk_target(provider: TranslationProvider) -> None:
+    metrics = _safe_provider_metrics(provider)
+    events: list[dict[str, Any]] = metrics.get("events", [])
+    if not events:
+        return
+
+    recent = events[-5:]
+    avg_latency = sum(int(e.get("latency_ms", 0)) for e in recent) / len(recent)
+    recent_errors = sum(1 for e in recent if not e.get("success", True))
+    fallback_used = any(bool(e.get("fallback_used", False)) for e in recent)
+
+    target = int(st.session_state.get("job_chunk_target_chars", 12000))
+    if recent_errors > 0 or fallback_used or avg_latency > 6500:
+        target = max(2000, int(target * 0.8))
+    elif avg_latency < 2500 and recent_errors == 0:
+        target = min(30000, int(target * 1.1))
+
+    st.session_state.job_chunk_target_chars = target
+    if "job_perf" in st.session_state:
+        st.session_state.job_perf["chunk_target_chars"] = target
+
+
+def _render_performance_panel() -> None:
+    perf: dict[str, Any] = st.session_state.get("job_perf", {})
+    if not perf:
+        return
+
+    st.subheader("Performance")
+    segments_total = int(perf.get("segments_total", 0))
+    misses_total = int(perf.get("cache_misses_total", 0))
+    unique_misses = int(perf.get("unique_misses_total", 0))
+    hit_rate = 0.0
+    if segments_total:
+        hit_rate = 1 - (misses_total / segments_total)
+
+    cols = st.columns(4)
+    cols[0].metric("Cache hit rate", f"{hit_rate*100:.1f}%")
+    cols[1].metric("HTTP requests", str(perf.get("http_requests_total", 0)))
+    cols[2].metric("Fallbacks", str(perf.get("fallback_count", 0)))
+    cols[3].metric("Chunk target chars", str(perf.get("chunk_target_chars", 0)))
+
+    cols2 = st.columns(4)
+    cols2[0].metric("Segments", str(segments_total))
+    cols2[1].metric("Misses", str(misses_total))
+    cols2[2].metric("Unique misses", str(unique_misses))
+    cols2[3].metric("Provider errors", str(perf.get("error_count", 0)))
+
+    events = perf.get("last_events", [])
+    if events:
+        st.caption("Recent OpenAI calls")
+        st.dataframe(pd.DataFrame(events), width="stretch")
+
 def column_stats(df: pd.DataFrame, column: str) -> tuple[int, int, int]:
     series = df[column].fillna("").astype(str)
     non_empty = int((series.str.strip() != "").sum())
@@ -102,6 +203,9 @@ def _job_reset() -> None:
         "job_cache_json",
         "provider_signature",
         "provider_instance",
+        "job_perf",
+        "job_chunk_target_chars",
+        "job_started_at",
     ]:
         st.session_state.pop(key, None)
 
@@ -128,6 +232,23 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
     st.session_state.job_translated_count = 0
     st.session_state.job_error_count = 0
     st.session_state.job_settings = settings
+    st.session_state.job_chunk_target_chars = 12000
+    st.session_state.job_started_at = pd.Timestamp.utcnow()
+    st.session_state.job_perf = {
+        "segments_total": 0,
+        "cache_misses_total": 0,
+        "unique_misses_total": 0,
+        "chunks_sent": 0,
+        "chunk_target_chars": 12000,
+        "last_events": [],
+        "http_requests_total": 0,
+        "fallback_count": 0,
+        "error_count": 0,
+        "success_count": 0,
+        "latency_ms_total": 0,
+        "input_chars_total": 0,
+        "input_items_total": 0,
+    }
 
 
 def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
@@ -159,20 +280,33 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
     unique_misses: list[str] = []
     unique_seen: set[str] = set()
+    cache_miss_count = 0
     for segment in all_segments:
         cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
         if cached is not None:
             continue
+        cache_miss_count += 1
         if segment not in unique_seen:
             unique_seen.add(segment)
             unique_misses.append(segment)
 
     if unique_misses:
-        for miss_chunk in _chunk_by_char_budget(unique_misses):
+        target_chars = int(st.session_state.get("job_chunk_target_chars", 12000))
+        miss_chunks = _chunk_by_char_budget(unique_misses, target_chars=target_chars)
+        st.session_state.job_perf["chunks_sent"] += len(miss_chunks)
+        for miss_chunk in miss_chunks:
             translated = provider.translate_texts(miss_chunk, source_lang, target_lang)
             for orig, tr in zip(miss_chunk, translated):
                 fixed = glossary.get(tr, tr)
                 cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
+
+    _update_job_perf_metrics(
+        provider=provider,
+        total_segments=len(all_segments),
+        cache_misses=cache_miss_count,
+        unique_misses=len(unique_misses),
+    )
+    _autotune_chunk_target(provider)
 
     for record in task_records:
         row_idx = record["row_idx"]
@@ -373,6 +507,7 @@ def main() -> None:
         _ensure_job(input_df, settings, translate_columns, skip_columns)
 
     if st.session_state.get("job_active"):
+        _render_performance_panel()
         total = len(st.session_state.job_tasks)
         done = st.session_state.job_cursor
         st.progress((done / total) if total else 1.0)
@@ -384,6 +519,7 @@ def main() -> None:
                 st.rerun()
 
     if st.session_state.get("job_status") == "completed":
+        _render_performance_panel()
         st.success("Překlad dokončen")
         st.download_button("Stáhnout translated.csv", data=BytesIO(st.session_state.job_translated_csv), file_name="translated.csv", mime="text/csv")
         st.download_button("Stáhnout translation_report.csv", data=BytesIO(st.session_state.job_report_csv), file_name="translation_report.csv", mime="text/csv")

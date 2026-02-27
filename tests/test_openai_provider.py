@@ -1,3 +1,5 @@
+from collections import deque
+
 from translator.openai_provider import OpenAIProvider, _coerce_batch_response
 
 
@@ -6,6 +8,9 @@ def _provider_stub() -> OpenAIProvider:
     provider.use_batch_api = True
     provider.model = "gpt-4o-mini"
     provider.max_parallel_requests = 4
+    provider._http_requests_total = 0
+    provider._translate_calls_total = 0
+    provider._events = deque(maxlen=200)
     return provider
 
 
@@ -38,6 +43,8 @@ def test_translate_texts_falls_back_when_batch_shape_invalid(monkeypatch) -> Non
     translated = provider.translate_texts(["one", "two"], "cs", "sk")
 
     assert translated == ["tr:one", "tr:two"]
+    metrics = provider.get_metrics_snapshot()
+    assert metrics["fallback_count"] == 1
 
 
 def test_translate_texts_raises_non_batch_runtime_error(monkeypatch) -> None:
@@ -55,3 +62,16 @@ def test_translate_texts_raises_non_batch_runtime_error(monkeypatch) -> None:
         assert False, "expected RuntimeError"
     except RuntimeError as exc:
         assert str(exc) == "other_error"
+
+
+def test_get_metrics_snapshot_exposes_events(monkeypatch) -> None:
+    provider = _provider_stub()
+
+    monkeypatch.setattr(provider, "_batch", lambda *args, **kwargs: ["a"])
+    out = provider.translate_texts(["x"], "cs", "sk")
+
+    assert out == ["a"]
+    metrics = provider.get_metrics_snapshot()
+    assert metrics["translate_calls_total"] == 1
+    assert metrics["events_count"] == 1
+    assert metrics["events"][0]["mode"] == "batch"
