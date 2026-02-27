@@ -72,17 +72,37 @@ class ShoptetClient:
                             return [x for x in nested_value if isinstance(x, dict)]
         return []
 
+    def _fetch_products_page(self, page: int, include_pagination: bool) -> requests.Response:
+        params: dict[str, Any] | None = None
+        if include_pagination:
+            params = {self.config.page_param: page, self.config.page_size_param: self.config.page_size}
+        resp = requests.get(self._url(self.config.products_endpoint), headers=self._headers(), params=params, timeout=self.timeout_s)
+        return resp
+
     def fetch_products(self, max_pages: int = 100) -> list[dict[str, Any]]:
         products: list[dict[str, Any]] = []
+        use_pagination = True
+
         for page in range(1, max_pages + 1):
-            params = {self.config.page_param: page, self.config.page_size_param: self.config.page_size}
-            resp = requests.get(self._url(self.config.products_endpoint), headers=self._headers(), params=params, timeout=self.timeout_s)
+            resp = self._fetch_products_page(page=page, include_pagination=use_pagination)
+            if page == 1 and use_pagination and resp.status_code == 400:
+                logger.warning(
+                    "Shoptet API rejected pagination params (%s/%s). Retrying first page without params.",
+                    self.config.page_param,
+                    self.config.page_size_param,
+                )
+                use_pagination = False
+                resp = self._fetch_products_page(page=page, include_pagination=False)
+
             resp.raise_for_status()
             payload = resp.json()
             items = self._extract_items(payload)
             if not items:
                 break
+
             products.extend(items)
+            if not use_pagination:
+                break
             if len(items) < self.config.page_size:
                 break
         return products
