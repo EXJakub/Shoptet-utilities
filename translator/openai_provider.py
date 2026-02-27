@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from openai import AsyncOpenAI, OpenAI
@@ -10,6 +11,34 @@ from openai import AsyncOpenAI, OpenAI
 from translator.base import TranslationProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_markdown_fence(raw: str) -> str:
+    text = raw.strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _coerce_batch_response(raw: str, expected_len: int) -> list[str]:
+    candidate = _strip_markdown_fence(raw)
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"batch_parse_error: {exc}") from exc
+
+    if isinstance(parsed, dict):
+        for key in ("translations", "items", "results", "data"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                parsed = value
+                break
+
+    if not isinstance(parsed, list) or len(parsed) != expected_len:
+        raise RuntimeError("batch_invalid_shape: response must be a list with same length as input")
+
+    return [str(item) for item in parsed]
 
 
 class OpenAIProvider(TranslationProvider):
@@ -105,17 +134,19 @@ class OpenAIProvider(TranslationProvider):
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
         raw = self._retry_call(payload)
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"batch_parse_error: {exc}") from exc
-        if not isinstance(parsed, list) or len(parsed) != len(texts):
-            raise RuntimeError("batch_invalid_shape: response must be a list with same length as input")
-        return [str(item) for item in parsed]
+        return _coerce_batch_response(raw, expected_len=len(texts))
 
     def translate_texts(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
-        if self.use_batch_api:
-            return self._batch(texts, source_lang, target_lang)
         if not texts:
             return []
+
+        if self.use_batch_api:
+            try:
+                return self._batch(texts, source_lang, target_lang)
+            except RuntimeError as exc:
+                if str(exc).startswith("batch_"):
+                    logger.warning("Batch translation failed (%s), falling back to parallel requests.", exc)
+                else:
+                    raise
+
         return asyncio.run(self._translate_parallel_async(texts, source_lang, target_lang))
