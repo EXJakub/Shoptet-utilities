@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from cache import TranslationCache
 from csv_io import CsvFormat, dataframe_to_csv_bytes, read_csv_from_upload
-from html_translate import HTML_TAG_RE, TranslationOptions, translate_cell
+from html_translate import HTML_TAG_RE, TranslationOptions, build_translation_plan, render_translation_plan
 from reporting import ReportRecord, make_record, report_to_dataframe
 from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
 from translator.base import TranslationProvider
@@ -39,6 +39,45 @@ def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_reques
     raise ValueError("Zvolený provider není implementovaný.")
 
 
+
+def _provider_signature(settings: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        settings["provider_name"],
+        settings["model"],
+        bool(settings["use_batch_api"]),
+        int(settings["max_parallel_requests"]),
+    )
+
+
+def _get_provider_for_job(settings: dict[str, Any]) -> TranslationProvider:
+    signature = _provider_signature(settings)
+    cached_signature = st.session_state.get("provider_signature")
+    provider = st.session_state.get("provider_instance")
+    if provider is not None and cached_signature == signature:
+        return provider
+
+    provider = get_provider(*signature)
+    st.session_state.provider_signature = signature
+    st.session_state.provider_instance = provider
+    return provider
+
+
+def _chunk_by_char_budget(texts: list[str], target_chars: int = 12000, max_items: int = 128) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for text in texts:
+        text_len = max(1, len(text))
+        if current and (len(current) >= max_items or current_chars + text_len > target_chars):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(text)
+        current_chars += text_len
+    if current:
+        chunks.append(current)
+    return chunks
+
 def column_stats(df: pd.DataFrame, column: str) -> tuple[int, int, int]:
     series = df[column].fillna("").astype(str)
     non_empty = int((series.str.strip() != "").sum())
@@ -61,6 +100,8 @@ def _job_reset() -> None:
         "job_translated_csv",
         "job_report_csv",
         "job_cache_json",
+        "provider_signature",
+        "provider_instance",
     ]:
         st.session_state.pop(key, None)
 
@@ -94,12 +135,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         return
 
     settings: dict[str, Any] = st.session_state.job_settings
-    provider = get_provider(
-        settings["provider_name"],
-        settings["model"],
-        settings["use_batch_api"],
-        settings["max_parallel_requests"],
-    )
+    provider = _get_provider_for_job(settings)
     options = TranslationOptions(**settings["translation_options"])
     glossary: dict[str, str] = settings["glossary"]
     source_lang = settings["source_lang"]
@@ -109,34 +145,45 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     per_run_cells = int(settings["per_run_cells"])
 
     cache = TranslationCache()
-
-    def translate_with_cache(chunks: list[str]) -> list[str]:
-        results: list[str] = [""] * len(chunks)
-        misses: list[str] = []
-        miss_positions: list[int] = []
-        for i, ch in enumerate(chunks):
-            cached = cache.get(ch, source_lang, target_lang, provider.name, provider.model)
-            if cached is not None:
-                results[i] = cached
-            else:
-                misses.append(ch)
-                miss_positions.append(i)
-        if misses:
-            translated = provider.translate_texts(misses, source_lang, target_lang)
-            for pos, orig, tr in zip(miss_positions, misses, translated):
-                fixed = glossary.get(tr, tr)
-                results[pos] = fixed
-                cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
-        return results
-
     tasks: list[tuple[int, str]] = st.session_state.job_tasks
     end_cursor = min(st.session_state.job_cursor + per_run_cells, len(tasks))
 
+    task_records: list[dict[str, Any]] = []
+    all_segments: list[str] = []
     for idx in range(st.session_state.job_cursor, end_cursor):
         row_idx, col = tasks[idx]
         source = str(source_df.at[row_idx, col] or "")
+        plan = build_translation_plan(source, options, max_chars=max_chars)
+        task_records.append({"row_idx": row_idx, "col": col, "source": source, "plan": plan})
+        all_segments.extend(plan.segments)
+
+    unique_misses: list[str] = []
+    unique_seen: set[str] = set()
+    for segment in all_segments:
+        cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
+        if cached is not None:
+            continue
+        if segment not in unique_seen:
+            unique_seen.add(segment)
+            unique_misses.append(segment)
+
+    if unique_misses:
+        for miss_chunk in _chunk_by_char_budget(unique_misses):
+            translated = provider.translate_texts(miss_chunk, source_lang, target_lang)
+            for orig, tr in zip(miss_chunk, translated):
+                fixed = glossary.get(tr, tr)
+                cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
+
+    for record in task_records:
+        row_idx = record["row_idx"]
+        col = record["col"]
+        source = record["source"]
+        plan = record["plan"]
         try:
-            translated_value = translate_cell(source, translate_with_cache, options, max_chars=max_chars)
+            translated_segments = [
+                cache.get(segment, source_lang, target_lang, provider.name, provider.model) or segment for segment in plan.segments
+            ]
+            translated_value = render_translation_plan(plan, translated_segments)
             href_ok, href_msg = validate_hrefs(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             struct_ok, struct_msg = validate_structure(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             if not (href_ok and struct_ok):
@@ -242,7 +289,7 @@ def main() -> None:
         input_df = st.session_state.api_loaded_df.copy()
 
     st.write(f"Řádků: {len(input_df)} | Sloupců: {len(input_df.columns)}")
-    st.dataframe(input_df.head(20), use_container_width=True)
+    st.dataframe(input_df.head(20), width="stretch")
 
     columns = list(input_df.columns)
     st.subheader("Výběr sloupců")
@@ -254,7 +301,7 @@ def main() -> None:
         for col in translate_columns:
             non_empty, html_count, href_count = column_stats(input_df, col)
             stats.append({"column": col, "non_empty": non_empty, "html_cells": html_count, "href_cells": href_count})
-        st.dataframe(pd.DataFrame(stats), use_container_width=True)
+        st.dataframe(pd.DataFrame(stats), width="stretch")
 
     st.subheader("Nastavení překladu")
     provider_name = st.selectbox("Provider", ["OpenAI"])
@@ -357,7 +404,7 @@ def main() -> None:
                     )
                     st.success(f"SK update hotov: updated={updated}, missing_ean={missing}")
                     if sync_errors:
-                        st.dataframe(pd.DataFrame(sync_errors), use_container_width=True)
+                        st.dataframe(pd.DataFrame(sync_errors), width="stretch")
                 except Exception as exc:
                     st.error(f"SK update selhal: {exc}")
 

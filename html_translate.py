@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from bs4 import BeautifulSoup, NavigableString
 
@@ -20,6 +20,21 @@ class TranslationOptions:
     skip_emails: bool = True
     skip_codes: bool = True
     skip_units: bool = True
+
+
+@dataclass(slots=True)
+class _HtmlNodePlan:
+    node: NavigableString
+    segment_count: int
+
+
+@dataclass(slots=True)
+class TranslationPlan:
+    mode: str  # plain|html|skip
+    original: str
+    segments: list[str]
+    soup: Any | None = None
+    html_nodes: list[_HtmlNodePlan] | None = None
 
 
 def is_html(text: str) -> bool:
@@ -57,12 +72,67 @@ def split_long_text(text: str, max_chars: int) -> list[str]:
     return parts
 
 
+def build_translation_plan(value: str | None, options: TranslationOptions, max_chars: int) -> TranslationPlan:
+    if value is None:
+        return TranslationPlan(mode="skip", original="", segments=[])
+
+    text = str(value)
+    as_html = options.mode == "FORCE_HTML" or (options.mode == "AUTO" and is_html(text))
+
+    if not as_html:
+        if should_skip_text(text, options):
+            return TranslationPlan(mode="skip", original=text, segments=[])
+        return TranslationPlan(mode="plain", original=text, segments=split_long_text(text, max_chars=max_chars))
+
+    soup = BeautifulSoup(text, "lxml")
+    html_nodes: list[_HtmlNodePlan] = []
+    segments: list[str] = []
+
+    for node in soup.find_all(string=True):
+        parent_name = node.parent.name if node.parent else ""
+        if parent_name in {"script", "style"}:
+            continue
+        node_text = str(node)
+        if should_skip_text(node_text, options):
+            continue
+        node_segments = split_long_text(node_text, max_chars=max_chars)
+        segments.extend(node_segments)
+        html_nodes.append(_HtmlNodePlan(node=node, segment_count=len(node_segments)))
+
+    if not segments:
+        return TranslationPlan(mode="skip", original=text, segments=[])
+
+    return TranslationPlan(mode="html", original=text, segments=segments, soup=soup, html_nodes=html_nodes)
+
+
+def render_translation_plan(plan: TranslationPlan, translated_segments: list[str]) -> str:
+    if plan.mode == "skip":
+        return plan.original
+
+    if plan.mode == "plain":
+        return "".join(translated_segments)
+
+    if plan.mode != "html" or plan.soup is None or plan.html_nodes is None:
+        raise RuntimeError("Invalid translation plan.")
+
+    cursor = 0
+    for node_plan in plan.html_nodes:
+        translated = "".join(translated_segments[cursor : cursor + node_plan.segment_count])
+        cursor += node_plan.segment_count
+        node_plan.node.replace_with(translated)
+
+    body = plan.soup.body
+    if body:
+        return "".join(str(x) for x in body.contents)
+    return str(plan.soup)
+
+
 def translate_plain_text(text: str, translate_fn: Callable[[list[str]], list[str]], options: TranslationOptions, max_chars: int) -> str:
-    if should_skip_text(text, options):
-        return text
-    segments = split_long_text(text, max_chars=max_chars)
-    translated = translate_fn(segments)
-    return "".join(translated)
+    plan = build_translation_plan(text, options, max_chars=max_chars)
+    if plan.mode == "skip":
+        return plan.original
+    translated = translate_fn(plan.segments)
+    return render_translation_plan(plan, translated)
 
 
 def translate_html_text_nodes(
@@ -71,32 +141,18 @@ def translate_html_text_nodes(
     options: TranslationOptions,
     max_chars: int,
 ) -> str:
-    # lxml parser is selected for robust, tolerant parsing of broken e-commerce HTML while keeping attrs accessible.
-    soup = BeautifulSoup(html, "lxml")
-    text_nodes: list[NavigableString] = []
-    originals: list[str] = []
-
-    for node in soup.find_all(string=True):
-        parent_name = node.parent.name if node.parent else ""
-        if parent_name in {"script", "style"}:
-            continue
-        value = str(node)
-        if should_skip_text(value, options):
-            continue
-        text_nodes.append(node)
-        originals.append(value)
-
-    translated_values: list[str] = []
-    for text in originals:
-        translated_values.append(translate_plain_text(text, translate_fn, options=options, max_chars=max_chars))
-
-    for node, translated in zip(text_nodes, translated_values):
-        node.replace_with(translated)
-
-    body = soup.body
-    if body:
-        return "".join(str(x) for x in body.contents)
-    return str(soup)
+    forced_options = TranslationOptions(
+        mode="FORCE_HTML",
+        skip_urls=options.skip_urls,
+        skip_emails=options.skip_emails,
+        skip_codes=options.skip_codes,
+        skip_units=options.skip_units,
+    )
+    plan = build_translation_plan(html, forced_options, max_chars=max_chars)
+    if plan.mode == "skip":
+        return plan.original
+    translated = translate_fn(plan.segments)
+    return render_translation_plan(plan, translated)
 
 
 def translate_cell(
@@ -105,10 +161,8 @@ def translate_cell(
     options: TranslationOptions,
     max_chars: int,
 ) -> str:
-    if value is None:
-        return ""
-    if options.mode == "FORCE_TEXT":
-        return translate_plain_text(value, translate_fn, options, max_chars=max_chars)
-    if options.mode == "FORCE_HTML" or (options.mode == "AUTO" and is_html(value)):
-        return translate_html_text_nodes(value, translate_fn, options, max_chars=max_chars)
-    return translate_plain_text(value, translate_fn, options, max_chars=max_chars)
+    plan = build_translation_plan(value, options, max_chars=max_chars)
+    if plan.mode == "skip":
+        return plan.original
+    translated = translate_fn(plan.segments)
+    return render_translation_plan(plan, translated)
