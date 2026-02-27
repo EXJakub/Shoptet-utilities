@@ -262,10 +262,10 @@ def main() -> None:
     source_lang = st.text_input("Source language", value="cs")
     target_lang = st.text_input("Target language", value="sk")
     max_chars = st.number_input("Max chars per request", min_value=100, max_value=8000, value=1200, step=100)
-    per_run_cells = st.number_input("Počet buněk na jeden běh", min_value=1, max_value=500, value=40, step=1)
+    per_run_cells = st.number_input("Počet buněk na jeden běh", min_value=1, max_value=500, value=120, step=1)
     html_mode = st.selectbox("HTML režim", ["AUTO", "FORCE_HTML", "FORCE_TEXT"])
-    use_batch_api = st.checkbox("Použít batch API", value=False)
-    max_parallel_requests = st.number_input("Max paralelních OpenAI requestů", min_value=1, max_value=64, value=8, disabled=use_batch_api)
+    use_batch_api = st.checkbox("Použít batch API", value=True)
+    max_parallel_requests = st.number_input("Max paralelních OpenAI requestů", min_value=1, max_value=64, value=16, disabled=use_batch_api)
 
     skip_urls = st.checkbox("URL v textu neměnit", value=True)
     skip_emails = st.checkbox("E-maily neměnit", value=True)
