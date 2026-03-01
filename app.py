@@ -179,6 +179,27 @@ def _render_performance_panel() -> None:
         st.caption("Recent OpenAI calls")
         st.dataframe(pd.DataFrame(events), width="stretch")
 
+
+
+def _rebalance_chunks_for_parallelism(chunks: list[list[str]], desired_chunks: int) -> list[list[str]]:
+    if desired_chunks <= 1 or len(chunks) >= desired_chunks:
+        return chunks
+
+    flat: list[str] = [item for chunk in chunks for item in chunk]
+    if len(flat) <= 1:
+        return chunks
+
+    desired = min(desired_chunks, len(flat))
+    base = len(flat) // desired
+    extra = len(flat) % desired
+    out: list[list[str]] = []
+    cursor = 0
+    for i in range(desired):
+        size = base + (1 if i < extra else 0)
+        out.append(flat[cursor:cursor + size])
+        cursor += size
+    return out
+
 def column_stats(df: pd.DataFrame, column: str) -> tuple[int, int, int]:
     series = df[column].fillna("").astype(str)
     non_empty = int((series.str.strip() != "").sum())
@@ -292,7 +313,13 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
     if unique_misses:
         target_chars = int(st.session_state.get("job_chunk_target_chars", 12000))
-        miss_chunks = _chunk_by_char_budget(unique_misses, target_chars=target_chars)
+        batch_max_items = 64 if bool(settings.get("use_batch_api")) else 128
+        miss_chunks = _chunk_by_char_budget(unique_misses, target_chars=target_chars, max_items=batch_max_items)
+
+        if bool(settings.get("use_batch_api")):
+            desired_chunks = max(1, int(settings.get("max_parallel_requests", 1)))
+            miss_chunks = _rebalance_chunks_for_parallelism(miss_chunks, desired_chunks=desired_chunks)
+
         st.session_state.job_perf["chunks_sent"] += len(miss_chunks)
         translate_chunks = getattr(provider, "translate_text_chunks", None)
         if callable(translate_chunks):
