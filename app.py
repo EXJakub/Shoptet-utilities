@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import zipfile
 from io import BytesIO
 from typing import Any
 
@@ -44,6 +45,60 @@ def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_reques
     raise ValueError("Zvolený provider není implementovaný.")
 
 
+
+
+
+def _quality_report_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(records, columns=QUALITY_REPORT_COLUMNS)
+
+
+def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dict[str, Any]:
+    quality_df = _quality_report_to_dataframe(st.session_state.get("job_quality_report", []))
+    quality_counts = quality_df["issue"].value_counts().to_dict() if not quality_df.empty else {}
+    report_df = report_to_dataframe(st.session_state.get("job_report", []))
+    report_counts = report_df["error_type"].value_counts().to_dict() if not report_df.empty else {}
+
+    return {
+        "source_mode": settings.get("source_mode"),
+        "provider": {
+            "name": settings.get("provider_name"),
+            "model": settings.get("model"),
+            "use_batch_api": bool(settings.get("use_batch_api")),
+        },
+        "languages": {
+            "source": settings.get("source_lang"),
+            "target": settings.get("target_lang"),
+        },
+        "input": {
+            "row_count": int(len(source_df)),
+            "translate_columns": list(settings.get("translate_columns", [])),
+        },
+        "job": {
+            "status": st.session_state.get("job_status"),
+            "translated_cells": int(st.session_state.get("job_translated_count", 0)),
+            "error_count": int(st.session_state.get("job_error_count", 0)),
+        },
+        "translation_report": {
+            "row_count": int(len(report_df)),
+            "status_counts": report_counts,
+        },
+        "quality_report": {
+            "row_count": int(len(quality_df)),
+            "issue_counts": quality_counts,
+        },
+        "performance": st.session_state.get("job_perf", {}),
+    }
+
+
+def _build_validation_bundle_zip() -> bytes:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("translated.csv", st.session_state.get("job_translated_csv", b""))
+        archive.writestr("translation_report.csv", st.session_state.get("job_report_csv", b""))
+        archive.writestr("quality_report.csv", st.session_state.get("job_quality_csv", b""))
+        archive.writestr("translation_cache.json", st.session_state.get("job_cache_json", b""))
+        archive.writestr("validation_summary.json", st.session_state.get("job_validation_summary_json", b""))
+    return buffer.getvalue()
 
 def _provider_signature(settings: dict[str, Any]) -> tuple[Any, ...]:
     return (
@@ -234,6 +289,8 @@ def _job_reset() -> None:
         "job_perf",
         "job_chunk_target_chars",
         "job_started_at",
+        "job_validation_summary_json",
+        "job_validation_bundle_zip",
     ]:
         st.session_state.pop(key, None)
 
@@ -280,6 +337,8 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
         "quality_retry_count": 0,
         "quality_fail_count": 0,
     }
+    st.session_state.job_validation_summary_json = b""
+    st.session_state.job_validation_bundle_zip = b""
 
 
 def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
@@ -316,6 +375,21 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     for segment in all_segments:
         cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
         if cached is not None:
+            if revalidate_cache_hits_quality_gate:
+                cached_quality = assess_translation_quality(segment, cached, source_lang, target_lang)
+                if not cached_quality.ok:
+                    st.session_state.job_quality_report.append(
+                        {
+                            "source_hash": hashlib.sha256(segment.encode("utf-8")).hexdigest()[:16],
+                            "issue": cached_quality.code,
+                            "action": "cache_rejected",
+                            "message": cached_quality.message,
+                        }
+                    )
+                    cache_miss_count += 1
+                    if segment not in unique_seen:
+                        unique_seen.add(segment)
+                        unique_misses.append(segment)
             continue
         cache_miss_count += 1
         if segment not in unique_seen:
@@ -417,6 +491,25 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                 cache.get(segment, source_lang, target_lang, provider.name, provider.model) or segment for segment in plan.segments
             ]
             translated_value = render_translation_plan(plan, translated_segments)
+            quality = assess_translation_quality(source, translated_value, source_lang, target_lang)
+            if not quality.ok:
+                st.session_state.job_error_count += 1
+                st.session_state.job_report.append(
+                    make_record(row_idx, col, "quality_gate_failed", quality.message, source)
+                )
+                st.session_state.job_quality_report.append(
+                    {
+                        "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest()[:16],
+                        "issue": quality.code,
+                        "action": "cell_rejected",
+                        "message": quality.message,
+                        "row_index": row_idx,
+                        "column": col,
+                    }
+                )
+                if not keep_unsafe:
+                    translated_value = source
+
             href_ok, href_msg = validate_hrefs(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             struct_ok, struct_msg = validate_structure(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             if not (href_ok and struct_ok):
@@ -442,9 +535,12 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     st.session_state.job_translated_csv = dataframe_to_csv_bytes(st.session_state.job_df_out, fmt)
     report_df = report_to_dataframe(st.session_state.job_report)
     st.session_state.job_report_csv = report_df.to_csv(index=False).encode(fmt.encoding)
-    quality_df = pd.DataFrame(st.session_state.job_quality_report)
+    quality_df = _quality_report_to_dataframe(st.session_state.job_quality_report)
     st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
     st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
+    summary = _build_run_summary(source_df, settings)
+    st.session_state.job_validation_summary_json = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
+    st.session_state.job_validation_bundle_zip = _build_validation_bundle_zip()
 
 
 def _build_shoptet_client(prefix: str) -> ShoptetClient:
@@ -628,6 +724,8 @@ def main() -> None:
         st.download_button("Stáhnout translation_report.csv", data=BytesIO(st.session_state.job_report_csv), file_name="translation_report.csv", mime="text/csv")
         st.download_button("Stáhnout translation_cache.json", data=BytesIO(st.session_state.job_cache_json), file_name="translation_cache.json", mime="application/json")
         st.download_button("Stáhnout quality_report.csv", data=BytesIO(st.session_state.job_quality_csv), file_name="quality_report.csv", mime="text/csv")
+        st.download_button("Stáhnout validation_summary.json", data=BytesIO(st.session_state.job_validation_summary_json), file_name="validation_summary.json", mime="application/json")
+        st.download_button("Stáhnout validation_bundle.zip", data=BytesIO(st.session_state.job_validation_bundle_zip), file_name="validation_bundle.zip", mime="application/zip")
 
         if st.session_state.job_settings.get("source_mode") == "Shoptet API":
             st.subheader("Update SK produktů podle EAN")
