@@ -50,7 +50,17 @@ def _alpha_len(text: str) -> int:
     return sum(1 for ch in text if LETTER_RE.match(ch))
 
 
-def assess_translation_quality(source: str, translated: str, source_lang: str, target_lang: str) -> QualityCheckResult:
+def quality_tier_for_complexity(complexity: float) -> str:
+    return "strict" if complexity >= 0.6 else "fast"
+
+
+def assess_translation_quality(
+    source: str,
+    translated: str,
+    source_lang: str,
+    target_lang: str,
+    risk_tier: str = "strict",
+) -> QualityCheckResult:
     if not source.strip() or not translated.strip():
         return QualityCheckResult(ok=False, code="empty_translation", message="Translation output is empty.")
 
@@ -60,8 +70,12 @@ def assess_translation_quality(source: str, translated: str, source_lang: str, t
     src_norm = _normalize(source)
     tr_norm = _normalize(translated)
 
-    if src_norm == tr_norm and _alpha_len(source) >= 10:
+    unchanged_min = 6 if risk_tier == "strict" else 12
+    if src_norm == tr_norm and _alpha_len(source) >= unchanged_min:
         return QualityCheckResult(ok=False, code="unchanged_text", message="Long text is unchanged in CS→SK translation.")
+
+    if risk_tier == "fast":
+        return QualityCheckResult(ok=True, code="ok", message="ok")
 
     words = set(re.findall(r"[A-Za-zÀ-ž]+", tr_norm))
     has_czech = bool(words.intersection(CZECH_HINTS))

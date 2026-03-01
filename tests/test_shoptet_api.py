@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 import requests
 
-from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
+from shoptet_api import ShoptetApiError, ShoptetClient, ShoptetConfig, sync_translated_to_sk
 
 
 class DummyClient:
@@ -16,7 +16,7 @@ class DummyClient:
 
     def update_product(self, product_id: str, payload: dict[str, str]) -> None:
         if self._fail_product_id and product_id == self._fail_product_id:
-            raise RuntimeError("update failed")
+            raise ShoptetApiError("update failed")
 
 
 def test_sync_translated_to_sk_reports_string_row_index_for_missing_ean() -> None:
@@ -92,13 +92,13 @@ def test_fetch_products_fallbacks_without_pagination_on_400(monkeypatch: pytest.
     client = ShoptetClient(ShoptetConfig(base_url="https://example.com", token="x"))
     calls: list[dict[str, object]] = []
 
-    def fake_get(url: str, headers: dict[str, str], params: dict[str, object] | None, timeout: int) -> _FakeResponse:
-        calls.append({"url": url, "params": params})
+    def fake_request(method: str, url: str, headers: dict[str, str], params: dict[str, object] | None, json, timeout: int) -> _FakeResponse:
+        calls.append({"method": method, "url": url, "params": params})
         if params is not None:
             return _FakeResponse(400, {"message": "invalid query params"})
         return _FakeResponse(200, [{"id": 1, "ean": "123"}])
 
-    monkeypatch.setattr("shoptet_api.requests.get", fake_get)
+    monkeypatch.setattr(client.session, "request", fake_request)
 
     products = client.fetch_products()
 
@@ -110,10 +110,10 @@ def test_fetch_products_fallbacks_without_pagination_on_400(monkeypatch: pytest.
 def test_fetch_products_raises_after_fallback_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     client = ShoptetClient(ShoptetConfig(base_url="https://example.com", token="x"))
 
-    def fake_get(url: str, headers: dict[str, str], params: dict[str, object] | None, timeout: int) -> _FakeResponse:
+    def fake_request(method: str, url: str, headers: dict[str, str], params: dict[str, object] | None, json, timeout: int) -> _FakeResponse:
         return _FakeResponse(400, {"message": "bad request"})
 
-    monkeypatch.setattr("shoptet_api.requests.get", fake_get)
+    monkeypatch.setattr(client.session, "request", fake_request)
 
-    with pytest.raises(requests.HTTPError):
+    with pytest.raises(ShoptetApiError):
         client.fetch_products()

@@ -43,6 +43,9 @@ class _CacheStub:
     def save(self):
         return None
 
+    def export_json_bytes(self) -> bytes:
+        return b'{"stub": true}'
+
 
 def test_invalid_cache_hit_is_rejected_when_revalidation_enabled(monkeypatch) -> None:
     provider = _ProviderStub()
@@ -54,7 +57,7 @@ def test_invalid_cache_hit_is_rejected_when_revalidation_enabled(monkeypatch) ->
     monkeypatch.setattr(app, "validate_structure", lambda source, translated: (True, "ok"))
     monkeypatch.setattr(app, "_autotune_chunk_target", lambda provider: None)
 
-    def fake_assess_translation_quality(source, translated, source_lang, target_lang):
+    def fake_assess_translation_quality(source, translated, source_lang, target_lang, risk_tier="strict"):
         if translated == "BAD_CACHE":
             return SimpleNamespace(ok=False, code="unchanged_text", message="cache invalid")
         return SimpleNamespace(ok=True, code="ok", message="ok")
