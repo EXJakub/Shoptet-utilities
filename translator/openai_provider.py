@@ -141,13 +141,35 @@ class OpenAIProvider(TranslationProvider):
         system_prompt = (
             "You are a precise translation engine. "
             "Translate only natural language from source to target. "
-            "Do not add markup. Preserve URLs, emails, codes, product numbers and units exactly. "
+            "Do not add markup. Preserve URLs, emails, codes, product numbers, units, and placeholders like __KEEP_0__ exactly. "
             "Return only translated text."
         )
         user_prompt = f"source_lang={source_lang}\ntarget_lang={target_lang}\ntext:\n{text}"
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
+        ]
+
+    def _batch_system_prompt(self) -> str:
+        return (
+            "Translate each item from source_lang to target_lang. "
+            "Input is a JSON array of strings. "
+            "For each item: preserve meaning and tone; do not add markup, wrappers, explanations, or commentary. "
+            "Preserve URLs, emails, product codes, unique identifiers, units, and placeholders like __KEEP_0__ exactly. "
+            "If part of an item is non-translatable, keep that part unchanged and translate the rest. "
+            "Output requirements: return ONLY a valid JSON array of strings, with exactly the same number of items as input, "
+            "in the same order. No markdown fences. No wrapper objects."
+        )
+
+    def _batch_payload(self, texts: list[str], source_lang: str, target_lang: str) -> list[dict[str, str]]:
+        user_payload = {
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "texts": texts,
+        }
+        return [
+            {"role": "system", "content": self._batch_system_prompt()},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
 
     async def _one_async(self, text: str, source_lang: str, target_lang: str, sem: asyncio.Semaphore) -> str:
@@ -173,20 +195,7 @@ class OpenAIProvider(TranslationProvider):
             async with sem:
                 if not chunk:
                     return []
-                system_prompt = (
-                    "You are a precise translation engine. Translate each input item from source language to target language. "
-                    "Do not add markup or extra commentary. Preserve URLs, emails, product codes, identifiers, and units exactly. "
-                    "Return ONLY valid JSON array of translated strings in the same order and same length as input."
-                )
-                user_payload = {
-                    "source_lang": source_lang,
-                    "target_lang": target_lang,
-                    "texts": chunk,
-                }
-                payload = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-                ]
+                payload = self._batch_payload(chunk, source_lang, target_lang)
                 raw = await self._retry_call_async(payload)
                 return _coerce_batch_response(raw, expected_len=len(chunk))
 
@@ -236,20 +245,7 @@ class OpenAIProvider(TranslationProvider):
     def _batch(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
         if not texts:
             return []
-        system_prompt = (
-            "You are a precise translation engine. Translate each input item from source language to target language. "
-            "Do not add markup or extra commentary. Preserve URLs, emails, product codes, identifiers, and units exactly. "
-            "Return ONLY valid JSON array of translated strings in the same order and same length as input."
-        )
-        user_payload = {
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-            "texts": texts,
-        }
-        payload = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ]
+        payload = self._batch_payload(texts, source_lang, target_lang)
         raw = self._retry_call(payload)
         return _coerce_batch_response(raw, expected_len=len(texts))
 

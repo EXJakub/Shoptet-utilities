@@ -106,3 +106,14 @@ def test_translate_text_chunks_fallbacks_to_per_chunk(monkeypatch) -> None:
     out = provider.translate_text_chunks([["a", "b"], ["c"]], "cs", "sk")
 
     assert out == [["fallback:a", "fallback:b"], ["fallback:c"]]
+
+
+def test_batch_payload_contains_strict_array_contract() -> None:
+    provider = _provider_stub()
+
+    payload = provider._batch_payload(["a"], "cs", "sk")
+
+    system_msg = payload[0]["content"]
+    assert "exactly the same number of items" in system_msg
+    assert "No wrapper objects" in system_msg
+    assert "__KEEP_0__" in system_msg
