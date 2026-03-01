@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from csv_io import CsvFormat, dataframe_to_csv_bytes, read_csv_from_upload
 from html_translate import HTML_TAG_RE, TranslationOptions, build_translation_plan, render_translation_plan
 from reporting import ReportRecord, make_record, report_to_dataframe
 from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
+from translation_quality import assess_translation_quality
 from translator.base import TranslationProvider
 from translator.openai_provider import OpenAIProvider
 from validators import validate_hrefs, validate_structure
@@ -222,6 +224,8 @@ def _job_reset() -> None:
         "job_translated_csv",
         "job_report_csv",
         "job_cache_json",
+        "job_quality_report",
+        "job_quality_csv",
         "provider_signature",
         "provider_instance",
         "job_perf",
@@ -248,6 +252,7 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
     st.session_state.job_status = "running"
     st.session_state.job_df_out = df.copy()
     st.session_state.job_report = []
+    st.session_state.job_quality_report = []
     st.session_state.job_tasks = _build_tasks(df, translate_columns, skip_columns)
     st.session_state.job_cursor = 0
     st.session_state.job_translated_count = 0
@@ -269,6 +274,8 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
         "latency_ms_total": 0,
         "input_chars_total": 0,
         "input_items_total": 0,
+        "quality_retry_count": 0,
+        "quality_fail_count": 0,
     }
 
 
@@ -332,6 +339,33 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         for miss_chunk, translated in zip(miss_chunks, translated_chunks):
             for orig, tr in zip(miss_chunk, translated):
                 fixed = glossary.get(tr, tr)
+                quality = assess_translation_quality(orig, fixed, source_lang, target_lang)
+                if not quality.ok:
+                    st.session_state.job_perf["quality_retry_count"] += 1
+                    retry_candidate = provider.translate_texts([orig], source_lang, target_lang)[0]
+                    retry_fixed = glossary.get(retry_candidate, retry_candidate)
+                    retry_quality = assess_translation_quality(orig, retry_fixed, source_lang, target_lang)
+                    if retry_quality.ok:
+                        cache.set(orig, retry_fixed, source_lang, target_lang, provider.name, provider.model)
+                        st.session_state.job_quality_report.append(
+                            {
+                                "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
+                                "issue": quality.code,
+                                "action": "retry_fixed",
+                                "message": quality.message,
+                            }
+                        )
+                    else:
+                        st.session_state.job_perf["quality_fail_count"] += 1
+                        st.session_state.job_quality_report.append(
+                            {
+                                "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
+                                "issue": retry_quality.code,
+                                "action": "not_cached",
+                                "message": retry_quality.message,
+                            }
+                        )
+                    continue
                 cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
 
     _update_job_perf_metrics(
@@ -377,6 +411,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     st.session_state.job_translated_csv = dataframe_to_csv_bytes(st.session_state.job_df_out, fmt)
     report_df = report_to_dataframe(st.session_state.job_report)
     st.session_state.job_report_csv = report_df.to_csv(index=False).encode(fmt.encoding)
+    quality_df = pd.DataFrame(st.session_state.job_quality_report)
+    st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
     st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
 
 
@@ -558,6 +594,7 @@ def main() -> None:
         st.download_button("Stáhnout translated.csv", data=BytesIO(st.session_state.job_translated_csv), file_name="translated.csv", mime="text/csv")
         st.download_button("Stáhnout translation_report.csv", data=BytesIO(st.session_state.job_report_csv), file_name="translation_report.csv", mime="text/csv")
         st.download_button("Stáhnout translation_cache.json", data=BytesIO(st.session_state.job_cache_json), file_name="translation_cache.json", mime="application/json")
+        st.download_button("Stáhnout quality_report.csv", data=BytesIO(st.session_state.job_quality_csv), file_name="quality_report.csv", mime="text/csv")
 
         if st.session_state.job_settings.get("source_mode") == "Shoptet API":
             st.subheader("Update SK produktů podle EAN")
