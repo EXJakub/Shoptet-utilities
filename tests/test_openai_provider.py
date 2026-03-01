@@ -75,6 +75,7 @@ def test_get_metrics_snapshot_exposes_events(monkeypatch) -> None:
     assert metrics["translate_calls_total"] == 1
     assert metrics["events_count"] == 1
     assert metrics["events"][0]["mode"] == "batch"
+    assert "created_at" in metrics["events"][0]
 
 
 def test_translate_text_chunks_parallel_batch_preserves_order(monkeypatch) -> None:

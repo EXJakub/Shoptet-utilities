@@ -5,8 +5,9 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
@@ -25,6 +26,7 @@ class OpenAICallEvent:
     success: bool
     error_type: str | None = None
     fallback_used: bool = False
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 def _strip_markdown_fence(raw: str) -> str:
