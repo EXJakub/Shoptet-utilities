@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
+QUALITY_REPORT_COLUMNS = ["source_hash", "issue", "action", "message", "row_index", "column"]
+
+
 def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_requests: int) -> TranslationProvider:
     if name == "OpenAI":
         api_key = os.getenv("OPENAI_API_KEY", "")
@@ -292,6 +295,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     keep_unsafe = settings["keep_unsafe"]
     max_chars = int(settings["max_chars"])
     per_run_cells = int(settings["per_run_cells"])
+    revalidate_cache_hits_quality_gate = bool(settings.get("revalidate_cache_hits_quality_gate", False))
 
     cache = TranslationCache()
     tasks: list[tuple[int, str]] = st.session_state.job_tasks
@@ -550,6 +554,7 @@ def main() -> None:
     skip_codes = st.checkbox("SKU/EAN/kódy neměnit", value=True)
     skip_units = st.checkbox("Jednotky neměnit", value=True)
     keep_unsafe = st.checkbox("Keep translated anyway (unsafe)", value=False)
+    revalidate_cache_hits_quality_gate = st.checkbox("Revalidovat cache hity quality gate", value=False)
     glossary_json = st.text_area("Glossary JSON", value='{}')
 
     col_start, col_pause, col_resume, col_stop = st.columns(4)
@@ -589,6 +594,7 @@ def main() -> None:
             "use_batch_api": use_batch_api,
             "max_parallel_requests": int(max_parallel_requests),
             "keep_unsafe": keep_unsafe,
+            "revalidate_cache_hits_quality_gate": revalidate_cache_hits_quality_gate,
             "glossary": glossary,
             "per_run_cells": int(per_run_cells),
             "translation_options": {
