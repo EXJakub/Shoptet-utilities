@@ -45,6 +45,11 @@ def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_reques
 
 
 
+
+
+def _quality_report_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(records, columns=QUALITY_REPORT_COLUMNS)
+
 def _provider_signature(settings: dict[str, Any]) -> tuple[Any, ...]:
     return (
         settings["provider_name"],
@@ -316,6 +321,21 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     for segment in all_segments:
         cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
         if cached is not None:
+            if revalidate_cache_hits_quality_gate:
+                cached_quality = assess_translation_quality(segment, cached, source_lang, target_lang)
+                if not cached_quality.ok:
+                    st.session_state.job_quality_report.append(
+                        {
+                            "source_hash": hashlib.sha256(segment.encode("utf-8")).hexdigest()[:16],
+                            "issue": cached_quality.code,
+                            "action": "cache_rejected",
+                            "message": cached_quality.message,
+                        }
+                    )
+                    cache_miss_count += 1
+                    if segment not in unique_seen:
+                        unique_seen.add(segment)
+                        unique_misses.append(segment)
             continue
         cache_miss_count += 1
         if segment not in unique_seen:
@@ -417,6 +437,25 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                 cache.get(segment, source_lang, target_lang, provider.name, provider.model) or segment for segment in plan.segments
             ]
             translated_value = render_translation_plan(plan, translated_segments)
+            quality = assess_translation_quality(source, translated_value, source_lang, target_lang)
+            if not quality.ok:
+                st.session_state.job_error_count += 1
+                st.session_state.job_report.append(
+                    make_record(row_idx, col, "quality_gate_failed", quality.message, source)
+                )
+                st.session_state.job_quality_report.append(
+                    {
+                        "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest()[:16],
+                        "issue": quality.code,
+                        "action": "cell_rejected",
+                        "message": quality.message,
+                        "row_index": row_idx,
+                        "column": col,
+                    }
+                )
+                if not keep_unsafe:
+                    translated_value = source
+
             href_ok, href_msg = validate_hrefs(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             struct_ok, struct_msg = validate_structure(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             if not (href_ok and struct_ok):
@@ -442,7 +481,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     st.session_state.job_translated_csv = dataframe_to_csv_bytes(st.session_state.job_df_out, fmt)
     report_df = report_to_dataframe(st.session_state.job_report)
     st.session_state.job_report_csv = report_df.to_csv(index=False).encode(fmt.encoding)
-    quality_df = pd.DataFrame(st.session_state.job_quality_report)
+    quality_df = _quality_report_to_dataframe(st.session_state.job_quality_report)
     st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
     st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
 
