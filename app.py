@@ -568,9 +568,10 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     quality_df = _quality_report_to_dataframe(st.session_state.job_quality_report)
     st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
     st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
-    summary = _build_run_summary(source_df, settings)
-    st.session_state.job_validation_summary_json = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
-    st.session_state.job_validation_bundle_zip = _build_validation_bundle_zip()
+    if st.session_state.job_status == "completed":
+        summary = _build_run_summary(source_df, settings)
+        st.session_state.job_validation_summary_json = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
+        st.session_state.job_validation_bundle_zip = _build_validation_bundle_zip()
 
 
 def _build_shoptet_client(prefix: str) -> ShoptetClient:
