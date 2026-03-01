@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
+QUALITY_REPORT_COLUMNS = ["source_hash", "issue", "action", "message", "row_index", "column"]
+
+
 def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_requests: int) -> TranslationProvider:
     if name == "OpenAI":
         api_key = os.getenv("OPENAI_API_KEY", "")
@@ -87,6 +90,10 @@ def _safe_provider_metrics(provider: TranslationProvider) -> dict[str, Any]:
     if callable(getter):
         return getter()
     return {}
+
+
+def _quality_report_to_dataframe(quality_report: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(quality_report, columns=QUALITY_REPORT_COLUMNS)
 
 
 def _update_job_perf_metrics(
@@ -353,6 +360,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                                 "issue": quality.code,
                                 "action": "retry_fixed",
                                 "message": quality.message,
+                                "row_index": None,
+                                "column": None,
                             }
                         )
                     else:
@@ -363,6 +372,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                                 "issue": retry_quality.code,
                                 "action": "not_cached",
                                 "message": retry_quality.message,
+                                "row_index": None,
+                                "column": None,
                             }
                         )
                     continue
@@ -411,7 +422,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     st.session_state.job_translated_csv = dataframe_to_csv_bytes(st.session_state.job_df_out, fmt)
     report_df = report_to_dataframe(st.session_state.job_report)
     st.session_state.job_report_csv = report_df.to_csv(index=False).encode(fmt.encoding)
-    quality_df = pd.DataFrame(st.session_state.job_quality_report)
+    quality_df = _quality_report_to_dataframe(st.session_state.job_quality_report)
     st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
     st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
 
