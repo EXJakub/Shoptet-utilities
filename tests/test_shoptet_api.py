@@ -1,6 +1,8 @@
 import pandas as pd
+import pytest
+import requests
 
-from shoptet_api import ShoptetConfig, sync_translated_to_sk
+from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
 
 
 class DummyClient:
@@ -58,3 +60,60 @@ def test_sync_translated_to_sk_reports_string_row_index_for_update_error() -> No
     assert missing == 0
     assert report_errors[0]["row_index"] == "product-B"
     assert report_errors[0]["error_type"] == "sk_update_error"
+
+
+def test_shoptet_client_normalizes_base_url_without_scheme() -> None:
+    client = ShoptetClient(ShoptetConfig(base_url="myshop.cz", token="x"))
+
+    assert client._url("/api/products") == "https://myshop.cz/api/products"
+
+
+def test_shoptet_client_rejects_empty_base_url() -> None:
+    client = ShoptetClient(ShoptetConfig(base_url="   ", token="x"))
+
+    with pytest.raises(ValueError, match="nesmí být prázdné"):
+        client._url("/api/products")
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: object):
+        self.status_code = status_code
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} error")
+
+    def json(self) -> object:
+        return self._payload
+
+
+def test_fetch_products_fallbacks_without_pagination_on_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = ShoptetClient(ShoptetConfig(base_url="https://example.com", token="x"))
+    calls: list[dict[str, object]] = []
+
+    def fake_get(url: str, headers: dict[str, str], params: dict[str, object] | None, timeout: int) -> _FakeResponse:
+        calls.append({"url": url, "params": params})
+        if params is not None:
+            return _FakeResponse(400, {"message": "invalid query params"})
+        return _FakeResponse(200, [{"id": 1, "ean": "123"}])
+
+    monkeypatch.setattr("shoptet_api.requests.get", fake_get)
+
+    products = client.fetch_products()
+
+    assert products == [{"id": 1, "ean": "123"}]
+    assert calls[0]["params"] == {"page": 1, "limit": 100}
+    assert calls[1]["params"] is None
+
+
+def test_fetch_products_raises_after_fallback_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = ShoptetClient(ShoptetConfig(base_url="https://example.com", token="x"))
+
+    def fake_get(url: str, headers: dict[str, str], params: dict[str, object] | None, timeout: int) -> _FakeResponse:
+        return _FakeResponse(400, {"message": "bad request"})
+
+    monkeypatch.setattr("shoptet_api.requests.get", fake_get)
+
+    with pytest.raises(requests.HTTPError):
+        client.fetch_products()
