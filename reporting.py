@@ -6,6 +6,9 @@ from dataclasses import asdict, dataclass
 import pandas as pd
 
 
+REPORT_COLUMNS = ["row_index", "column", "error_type", "message", "source_length", "source_hash"]
+
+
 @dataclass(slots=True)
 class ReportRecord:
     row_index: int
@@ -28,4 +31,4 @@ def make_record(row_index: int, column: str, error_type: str, message: str, sour
 
 
 def report_to_dataframe(records: list[ReportRecord]) -> pd.DataFrame:
-    return pd.DataFrame([asdict(r) for r in records])
+    return pd.DataFrame([asdict(r) for r in records], columns=REPORT_COLUMNS)
