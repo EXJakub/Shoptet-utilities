@@ -52,11 +52,35 @@ def _quality_report_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(records, columns=QUALITY_REPORT_COLUMNS)
 
 
+def _increment_perf_counter(counter_name: str, key: str) -> None:
+    perf = st.session_state.setdefault("job_perf", {})
+    counters = perf.setdefault(counter_name, {})
+    counters[key] = int(counters.get(key, 0)) + 1
+
+
+def _append_job_report(record: ReportRecord) -> None:
+    st.session_state.job_report.append(record)
+    _increment_perf_counter("translation_error_type_counts", record.error_type)
+
+
+def _append_job_quality_record(record: dict[str, Any]) -> None:
+    st.session_state.job_quality_report.append(record)
+    issue = str(record.get("issue", "unknown"))
+    _increment_perf_counter("quality_issue_counts", issue)
+
+
 def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dict[str, Any]:
     quality_df = _quality_report_to_dataframe(st.session_state.get("job_quality_report", []))
-    quality_counts = quality_df["issue"].value_counts().to_dict() if not quality_df.empty else {}
     report_df = report_to_dataframe(st.session_state.get("job_report", []))
-    report_counts = report_df["error_type"].value_counts().to_dict() if not report_df.empty else {}
+    perf = st.session_state.get("job_perf", {})
+
+    quality_counts = dict(perf.get("quality_issue_counts") or {})
+    if not quality_counts and not quality_df.empty:
+        quality_counts = quality_df["issue"].value_counts().to_dict()
+
+    report_counts = dict(perf.get("translation_error_type_counts") or {})
+    if not report_counts and not report_df.empty:
+        report_counts = report_df["error_type"].value_counts().to_dict()
 
     return {
         "source_mode": settings.get("source_mode"),
@@ -336,6 +360,8 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
         "input_items_total": 0,
         "quality_retry_count": 0,
         "quality_fail_count": 0,
+        "translation_error_type_counts": {},
+        "quality_issue_counts": {},
     }
     st.session_state.job_validation_summary_json = b""
     st.session_state.job_validation_bundle_zip = b""
@@ -378,7 +404,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             if revalidate_cache_hits_quality_gate:
                 cached_quality = assess_translation_quality(segment, cached, source_lang, target_lang)
                 if not cached_quality.ok:
-                    st.session_state.job_quality_report.append(
+                    _append_job_quality_record(
                         {
                             "source_hash": hashlib.sha256(segment.encode("utf-8")).hexdigest()[:16],
                             "issue": cached_quality.code,
@@ -454,7 +480,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                 retry_quality = assess_translation_quality(orig, retry_fixed, source_lang, target_lang)
                 if retry_quality.ok:
                     cache.set(orig, retry_fixed, source_lang, target_lang, provider.name, provider.model)
-                    st.session_state.job_quality_report.append(
+                    _append_job_quality_record(
                         {
                             "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
                             "issue": initial_issue,
@@ -464,7 +490,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                     )
                 else:
                     st.session_state.job_perf["quality_fail_count"] += 1
-                    st.session_state.job_quality_report.append(
+                    _append_job_quality_record(
                         {
                             "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
                             "issue": retry_quality.code,
@@ -494,10 +520,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             quality = assess_translation_quality(source, translated_value, source_lang, target_lang)
             if not quality.ok:
                 st.session_state.job_error_count += 1
-                st.session_state.job_report.append(
-                    make_record(row_idx, col, "quality_gate_failed", quality.message, source)
-                )
-                st.session_state.job_quality_report.append(
+                _append_job_report(make_record(row_idx, col, "quality_gate_failed", quality.message, source))
+                _append_job_quality_record(
                     {
                         "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest()[:16],
                         "issue": quality.code,
@@ -514,8 +538,14 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             struct_ok, struct_msg = validate_structure(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             if not (href_ok and struct_ok):
                 st.session_state.job_error_count += 1
-                st.session_state.job_report.append(
-                    make_record(row_idx, col, "href_mismatch" if not href_ok else "structure_mismatch", f"{href_msg}; {struct_msg}", source)
+                _append_job_report(
+                    make_record(
+                        row_idx,
+                        col,
+                        "href_mismatch" if not href_ok else "structure_mismatch",
+                        f"{href_msg}; {struct_msg}",
+                        source,
+                    )
                 )
                 if not keep_unsafe:
                     translated_value = source
@@ -524,7 +554,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         except Exception as exc:
             logger.exception("Translation failure row=%s col=%s", row_idx, col)
             st.session_state.job_error_count += 1
-            st.session_state.job_report.append(make_record(row_idx, col, "api_error", str(exc), source))
+            _append_job_report(make_record(row_idx, col, "api_error", str(exc), source))
             st.session_state.job_df_out.at[row_idx, col] = source
 
     st.session_state.job_cursor = end_cursor
