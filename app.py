@@ -92,10 +92,6 @@ def _safe_provider_metrics(provider: TranslationProvider) -> dict[str, Any]:
     return {}
 
 
-def _quality_report_to_dataframe(quality_report: list[dict[str, Any]]) -> pd.DataFrame:
-    return pd.DataFrame(quality_report, columns=QUALITY_REPORT_COLUMNS)
-
-
 def _update_job_perf_metrics(
     provider: TranslationProvider,
     total_segments: int,
@@ -307,18 +303,12 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
     task_records: list[dict[str, Any]] = []
     all_segments: list[str] = []
-    segment_contexts: dict[str, list[tuple[int, str]]] = {}
     for idx in range(st.session_state.job_cursor, end_cursor):
         row_idx, col = tasks[idx]
         source = str(source_df.at[row_idx, col] or "")
         plan = build_translation_plan(source, options, max_chars=max_chars)
         task_records.append({"row_idx": row_idx, "col": col, "source": source, "plan": plan})
         all_segments.extend(plan.segments)
-        for segment in plan.segments:
-            segment_contexts.setdefault(segment, []).append((row_idx, col))
-
-    segment_quality_status: dict[str, str] = {}
-    segment_quality_message: dict[str, str] = {}
 
     unique_misses: list[str] = []
     unique_seen: set[str] = set()
@@ -326,21 +316,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     for segment in all_segments:
         cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
         if cached is not None:
-            if revalidate_cache_hits_quality_gate and source_lang == "cs" and target_lang == "sk":
-                cache_quality = assess_translation_quality(segment, cached, source_lang, target_lang)
-                if not cache_quality.ok:
-                    st.session_state.job_quality_report.append(
-                        {
-                            "source_hash": hashlib.sha256(segment.encode("utf-8")).hexdigest()[:16],
-                            "issue": cache_quality.code,
-                            "action": "cache_rejected",
-                            "message": cache_quality.message,
-                        }
-                    )
-                else:
-                    continue
-            else:
-                continue
+            continue
         cache_miss_count += 1
         if segment not in unique_seen:
             unique_seen.add(segment)
@@ -364,49 +340,64 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         else:
             translated_chunks = [provider.translate_texts(chunk, source_lang, target_lang) for chunk in miss_chunks]
 
+        retry_candidates: list[tuple[str, str, str]] = []
         for miss_chunk, translated in zip(miss_chunks, translated_chunks):
             for orig, tr in zip(miss_chunk, translated):
                 fixed = glossary.get(tr, tr)
                 quality = assess_translation_quality(orig, fixed, source_lang, target_lang)
-                if not quality.ok:
-                    st.session_state.job_perf["quality_retry_count"] += 1
-                    retry_candidate = provider.translate_texts([orig], source_lang, target_lang)[0]
-                    retry_fixed = glossary.get(retry_candidate, retry_candidate)
-                    retry_quality = assess_translation_quality(orig, retry_fixed, source_lang, target_lang)
-                    if retry_quality.ok:
-                        cache.set(orig, retry_fixed, source_lang, target_lang, provider.name, provider.model)
-                        segment_quality_status[orig] = "retry_fixed"
-                        segment_quality_message[orig] = quality.message
-                        for row_idx, col in segment_contexts.get(orig, []):
-                            st.session_state.job_quality_report.append(
-                                {
-                                    "row_index": row_idx,
-                                    "column": col,
-                                    "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
-                                    "issue": quality.code,
-                                    "action": "retry_fixed",
-                                    "message": quality.message,
-                                }
-                            )
-                    else:
-                        st.session_state.job_perf["quality_fail_count"] += 1
-                        segment_quality_status[orig] = "not_cached"
-                        segment_quality_message[orig] = retry_quality.message
-                        for row_idx, col in segment_contexts.get(orig, []):
-                            st.session_state.job_quality_report.append(
-                                {
-                                    "row_index": row_idx,
-                                    "column": col,
-                                    "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
-                                    "issue": retry_quality.code,
-                                    "action": "not_cached",
-                                    "message": retry_quality.message,
-                                }
-                            )
+                if quality.ok:
+                    cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
                     continue
-                cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
-                segment_quality_status[orig] = "cached"
-                segment_quality_message[orig] = quality.message
+
+                st.session_state.job_perf["quality_retry_count"] += 1
+                retry_candidates.append((orig, quality.code, quality.message))
+
+        if retry_candidates:
+            retry_texts = [orig for orig, _, _ in retry_candidates]
+            retry_max_items = 24 if bool(settings.get("use_batch_api")) else 64
+            retry_target_chars = max(4000, target_chars // 2)
+            retry_chunks = _chunk_by_char_budget(retry_texts, target_chars=retry_target_chars, max_items=retry_max_items)
+
+            if bool(settings.get("use_batch_api")):
+                max_parallel = max(1, int(settings.get("max_parallel_requests", 1)))
+                soft_desired = max(1, len(retry_texts) // 12)
+                desired_chunks = min(max_parallel, soft_desired)
+                retry_chunks = _rebalance_chunks_for_parallelism(retry_chunks, desired_chunks=desired_chunks)
+
+            st.session_state.job_perf["chunks_sent"] += len(retry_chunks)
+            if callable(translate_chunks):
+                retry_translated_chunks = translate_chunks(retry_chunks, source_lang, target_lang)
+            else:
+                retry_translated_chunks = [provider.translate_texts(chunk, source_lang, target_lang) for chunk in retry_chunks]
+
+            retry_results: dict[str, str] = {}
+            for retry_chunk, retry_translated in zip(retry_chunks, retry_translated_chunks):
+                for orig, tr in zip(retry_chunk, retry_translated):
+                    retry_results[orig] = glossary.get(tr, tr)
+
+            for orig, initial_issue, initial_message in retry_candidates:
+                retry_fixed = retry_results.get(orig, orig)
+                retry_quality = assess_translation_quality(orig, retry_fixed, source_lang, target_lang)
+                if retry_quality.ok:
+                    cache.set(orig, retry_fixed, source_lang, target_lang, provider.name, provider.model)
+                    st.session_state.job_quality_report.append(
+                        {
+                            "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
+                            "issue": initial_issue,
+                            "action": "retry_fixed",
+                            "message": initial_message,
+                        }
+                    )
+                else:
+                    st.session_state.job_perf["quality_fail_count"] += 1
+                    st.session_state.job_quality_report.append(
+                        {
+                            "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
+                            "issue": retry_quality.code,
+                            "action": "not_cached",
+                            "message": retry_quality.message,
+                        }
+                    )
 
     _update_job_perf_metrics(
         provider=provider,
@@ -422,33 +413,10 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         source = record["source"]
         plan = record["plan"]
         try:
-            failed_segments = [segment for segment in plan.segments if segment_quality_status.get(segment) == "not_cached"]
             translated_segments = [
                 cache.get(segment, source_lang, target_lang, provider.name, provider.model) or segment for segment in plan.segments
             ]
             translated_value = render_translation_plan(plan, translated_segments)
-            if failed_segments:
-                failed_count = len(failed_segments)
-                details = "; ".join(
-                    sorted(
-                        {
-                            f"{hashlib.sha256(segment.encode('utf-8')).hexdigest()[:16]}: {segment_quality_message.get(segment, 'quality gate failed')}"
-                            for segment in failed_segments
-                        }
-                    )
-                )
-                st.session_state.job_report.append(
-                    make_record(
-                        row_idx,
-                        col,
-                        "quality_gate_failed",
-                        f"{failed_count} segment(s) failed quality gate with action=not_cached. {details}",
-                        source,
-                    )
-                )
-                st.session_state.job_error_count += 1
-                if not keep_unsafe:
-                    translated_value = source
             href_ok, href_msg = validate_hrefs(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             struct_ok, struct_msg = validate_structure(source, translated_value) if HTML_TAG_RE.search(source) else (True, "ok")
             if not (href_ok and struct_ok):
@@ -474,7 +442,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     st.session_state.job_translated_csv = dataframe_to_csv_bytes(st.session_state.job_df_out, fmt)
     report_df = report_to_dataframe(st.session_state.job_report)
     st.session_state.job_report_csv = report_df.to_csv(index=False).encode(fmt.encoding)
-    quality_df = _quality_report_to_dataframe(st.session_state.job_quality_report)
+    quality_df = pd.DataFrame(st.session_state.job_quality_report)
     st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
     st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
 

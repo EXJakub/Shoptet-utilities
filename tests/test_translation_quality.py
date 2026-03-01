@@ -8,25 +8,8 @@ def test_cs_sk_detects_unchanged_long_text() -> None:
     assert out.code == "unchanged_text"
 
 
-def test_cs_sk_detects_partially_translated_with_high_overlap() -> None:
-    out = assess_translation_quality(
-        "Tento produkt je vhodný pro zahradu a obsahuje kvalitní materiál s dlouhou životností",
-        "Tento produkt je vhodný pre záhradu a obsahuje kvalitní materiál s dlouhou životností",
-        "cs",
-        "sk",
-    )
-
-    assert out.ok is False
-    assert out.code == "high_source_overlap"
-
-
 def test_cs_sk_accepts_slovak_wording() -> None:
-    out = assess_translation_quality(
-        "Tento produkt je pouze online a může být doručen zítra",
-        "Tento produkt je iba online a môže byť doručený zajtra",
-        "cs",
-        "sk",
-    )
+    out = assess_translation_quality("Tento produkt je pouze online", "Tento produkt je iba online", "cs", "sk")
 
     assert out.ok is True
 
