@@ -139,10 +139,10 @@ def _autotune_chunk_target(provider: TranslationProvider) -> None:
     fallback_used = any(bool(e.get("fallback_used", False)) for e in recent)
 
     target = int(st.session_state.get("job_chunk_target_chars", 12000))
-    if recent_errors > 0 or fallback_used or avg_latency > 6500:
-        target = max(2000, int(target * 0.8))
-    elif avg_latency < 2500 and recent_errors == 0:
-        target = min(30000, int(target * 1.1))
+    if recent_errors > 0 or fallback_used or avg_latency > 7500:
+        target = max(6000, int(target * 0.9))
+    elif avg_latency < 3000 and recent_errors == 0:
+        target = min(20000, int(target * 1.05))
 
     st.session_state.job_chunk_target_chars = target
     if "job_perf" in st.session_state:
@@ -313,11 +313,13 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
     if unique_misses:
         target_chars = int(st.session_state.get("job_chunk_target_chars", 12000))
-        batch_max_items = 64 if bool(settings.get("use_batch_api")) else 128
+        batch_max_items = 24 if bool(settings.get("use_batch_api")) else 96
         miss_chunks = _chunk_by_char_budget(unique_misses, target_chars=target_chars, max_items=batch_max_items)
 
         if bool(settings.get("use_batch_api")):
-            desired_chunks = max(1, int(settings.get("max_parallel_requests", 1)))
+            max_parallel = max(1, int(settings.get("max_parallel_requests", 1)))
+            soft_desired = max(1, len(unique_misses) // 12)
+            desired_chunks = min(max_parallel, soft_desired)
             miss_chunks = _rebalance_chunks_for_parallelism(miss_chunks, desired_chunks=desired_chunks)
 
         st.session_state.job_perf["chunks_sent"] += len(miss_chunks)
