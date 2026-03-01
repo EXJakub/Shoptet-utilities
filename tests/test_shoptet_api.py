@@ -10,13 +10,21 @@ class DummyClient:
         self.config = ShoptetConfig(base_url="https://example.com", token="x", id_field="id")
         self._sk_df = sk_df
         self._fail_product_id = fail_product_id
+        self._requests = 0
+        self._errors = 0
 
     def fetch_products_df(self, max_pages: int = 100) -> pd.DataFrame:
         return self._sk_df
 
     def update_product(self, product_id: str, payload: dict[str, str]) -> None:
+        self._requests += 1
         if self._fail_product_id and product_id == self._fail_product_id:
+            self._errors += 1
             raise ShoptetApiError("update failed")
+
+    def get_metrics_snapshot(self) -> dict[str, float]:
+        ratio = self._errors / max(1, self._requests)
+        return {"request_count": float(self._requests), "error_count": float(self._errors), "error_ratio": float(ratio)}
 
 
 def test_sync_translated_to_sk_reports_string_row_index_for_missing_ean() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -48,6 +49,10 @@ class ShoptetClient:
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.session = self._build_session()
+        self._request_count = 0
+        self._error_count = 0
+        self._retryable_error_count = 0
+        self._total_latency_ms = 0
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
@@ -117,6 +122,7 @@ class ShoptetClient:
         json_payload: dict[str, Any] | None = None,
         allow_status_codes: set[int] | None = None,
     ) -> requests.Response:
+        started = time.perf_counter()
         try:
             response = self.session.request(
                 method,
@@ -127,22 +133,49 @@ class ShoptetClient:
                 timeout=self.timeout_s,
             )
         except requests.Timeout as exc:
+            self._request_count += 1
+            self._error_count += 1
+            self._retryable_error_count += 1
+            self._total_latency_ms += int((time.perf_counter() - started) * 1000)
             raise ShoptetRetryableError(f"Shoptet {method} timeout: {exc}") from exc
         except requests.ConnectionError as exc:
+            self._request_count += 1
+            self._error_count += 1
+            self._retryable_error_count += 1
+            self._total_latency_ms += int((time.perf_counter() - started) * 1000)
             raise ShoptetRetryableError(f"Shoptet {method} connection error: {exc}") from exc
         except requests.RequestException as exc:
+            self._request_count += 1
+            self._error_count += 1
+            self._total_latency_ms += int((time.perf_counter() - started) * 1000)
             raise ShoptetApiError(f"Shoptet {method} request failed: {exc}") from exc
 
+        self._request_count += 1
+        self._total_latency_ms += int((time.perf_counter() - started) * 1000)
         allow_status_codes = allow_status_codes or set()
         if response.status_code in allow_status_codes:
             return response
         if response.status_code in {429, 500, 502, 503, 504}:
+            self._error_count += 1
+            self._retryable_error_count += 1
             raise ShoptetRetryableError(f"Shoptet {method} transient HTTP {response.status_code}")
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
+            self._error_count += 1
             raise ShoptetApiError(f"Shoptet {method} failed with HTTP {response.status_code}") from exc
         return response
+
+    def get_metrics_snapshot(self) -> dict[str, float]:
+        error_ratio = self._error_count / max(1, self._request_count)
+        avg_latency_ms = self._total_latency_ms / max(1, self._request_count)
+        return {
+            "request_count": float(self._request_count),
+            "error_count": float(self._error_count),
+            "retryable_error_count": float(self._retryable_error_count),
+            "error_ratio": float(error_ratio),
+            "avg_latency_ms": float(avg_latency_ms),
+        }
 
     def fetch_products(self, max_pages: int = 100) -> list[dict[str, Any]]:
         products: list[dict[str, Any]] = []
@@ -188,6 +221,7 @@ def sync_translated_to_sk(
     columns_to_sync: list[str],
     ean_field: str,
     report_errors: list[dict[str, Any]],
+    max_error_ratio: float = 1.0,
 ) -> tuple[int, int]:
     sk_df = sk_client.fetch_products_df()
     if sk_df.empty:
@@ -242,4 +276,15 @@ def sync_translated_to_sk(
                     "message": f"EAN {ean}: {exc}",
                 }
             )
+        metrics = sk_client.get_metrics_snapshot()
+        if float(metrics.get("error_ratio", 0.0)) > max_error_ratio:
+            report_errors.append(
+                {
+                    "row_index": _report_row_index(idx),
+                    "column": ean_field,
+                    "error_type": "sync_blocked_high_error_ratio",
+                    "message": f"Sync halted: error ratio {metrics['error_ratio']:.2%} exceeded {max_error_ratio:.2%}",
+                }
+            )
+            break
     return updated, missing

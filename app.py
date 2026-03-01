@@ -7,6 +7,7 @@ import os
 import zipfile
 from io import BytesIO
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -19,6 +20,7 @@ from job_artifacts import should_checkpoint, write_job_artifacts
 from reporting import ReportRecord, make_record, report_to_dataframe
 from runtime_config import load_runtime_config, shoptet_from_session
 from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
+from telemetry import build_run_envelope, build_telemetry_exporter, evaluate_alerts, evaluate_run_gate
 from translation_quality import assess_translation_quality, quality_tier_for_complexity
 from translator.base import TranslationProvider
 from translator.openai_provider import OpenAIProvider
@@ -29,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 RUNTIME_CONFIG = load_runtime_config()
+TELEMETRY_EXPORTER = build_telemetry_exporter(RUNTIME_CONFIG.telemetry_backend, RUNTIME_CONFIG.telemetry_jsonl_path)
 
 
 QUALITY_REPORT_COLUMNS = ["source_hash", "issue", "action", "message", "row_index", "column"]
@@ -87,6 +90,12 @@ def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dic
         report_counts = report_df["error_type"].value_counts().to_dict()
 
     return {
+        "run": {
+            "run_id": st.session_state.get("job_run_id"),
+            "gate_passed": bool(st.session_state.get("job_run_gate_passed", False)),
+            "gate_reasons": list(st.session_state.get("job_run_gate_reasons", [])),
+            "publish_blocked_reason": st.session_state.get("job_publish_blocked_reason", ""),
+        },
         "source_mode": settings.get("source_mode"),
         "provider": {
             "name": settings.get("provider_name"),
@@ -115,6 +124,7 @@ def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dic
             "issue_counts": quality_counts,
         },
         "performance": st.session_state.get("job_perf", {}),
+        "alerts": st.session_state.get("job_alerts", []),
     }
 
 
@@ -195,6 +205,80 @@ def _safe_provider_metrics(provider: TranslationProvider) -> dict[str, Any]:
     if callable(getter):
         return getter()
     return {}
+
+
+def _gate_thresholds() -> dict[str, float]:
+    return {
+        "quality_fail_ratio": float(RUNTIME_CONFIG.quality_gate_max_fail_ratio),
+        "provider_error_ratio": float(RUNTIME_CONFIG.quality_gate_max_provider_error_ratio),
+        "batch_shape_error_rate": float(RUNTIME_CONFIG.quality_gate_max_batch_shape_error_rate),
+        "p95_latency_ms": float(RUNTIME_CONFIG.quality_gate_max_p95_latency_ms),
+    }
+
+
+def _calc_run_metrics() -> dict[str, float]:
+    perf: dict[str, Any] = st.session_state.get("job_perf", {})
+    translated_cells = max(1, int(st.session_state.get("job_translated_count", 0)))
+    quality_fail = int(perf.get("quality_fail_count", 0))
+    provider_errors = int(perf.get("error_count", 0))
+    p95_latency = 0.0
+    events = perf.get("last_events", [])
+    if events:
+        lat = sorted(int(e.get("latency_ms", 0)) for e in events)
+        p95_latency = float(lat[max(0, int(len(lat) * 0.95) - 1)])
+    return {
+        "quality_fail_ratio": quality_fail / translated_cells,
+        "provider_error_ratio": provider_errors / translated_cells,
+        "batch_shape_error_rate": float(perf.get("batch_shape_error_rate", 0.0)),
+        "p95_latency_ms": p95_latency,
+        "effective_tpm_estimate": float(perf.get("effective_tpm_estimate", 0)),
+        "cells_per_min": float(
+            int(st.session_state.get("job_translated_count", 0))
+            / max(
+                0.1,
+                (pd.Timestamp.utcnow() - st.session_state.get("job_started_at", pd.Timestamp.utcnow())).total_seconds() / 60.0,
+            )
+        ),
+        "cache_hit_rate": float(
+            1.0
+            - (
+                int(perf.get("cache_misses_total", 0))
+                / max(1, int(perf.get("segments_total", 0)))
+            )
+        ),
+    }
+
+
+def _emit_run_telemetry(phase: str) -> None:
+    metrics = _calc_run_metrics()
+    thresholds = _gate_thresholds()
+    alerts = evaluate_alerts(metrics, thresholds)
+    gate_passed, gate_reasons = evaluate_run_gate(metrics, thresholds)
+    st.session_state["job_alerts"] = [a.message for a in alerts]
+    st.session_state["job_run_gate_passed"] = gate_passed
+    st.session_state["job_run_gate_reasons"] = gate_reasons
+
+    envelope = build_run_envelope(
+        run_id=str(st.session_state.get("job_run_id", "")),
+        phase=phase,
+        status=str(st.session_state.get("job_status", "")),
+        metrics=metrics,
+        alerts=alerts,
+        gate_passed=gate_passed,
+        gate_reasons=gate_reasons,
+    )
+    TELEMETRY_EXPORTER.emit(envelope)
+
+
+def _should_revalidate_cache_hit(segment: str, complexity: float) -> bool:
+    if complexity >= 0.6:
+        return True
+    sample_rate = float(RUNTIME_CONFIG.cache_revalidation_low_risk_sample_rate)
+    if sample_rate <= 0:
+        return False
+    digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()
+    sample = (int(digest[:8], 16) % 10000) / 10000.0
+    return sample <= sample_rate
 
 
 def _update_job_perf_metrics(
@@ -328,6 +412,9 @@ def _apply_safe_mode_guard() -> None:
             6000,
             int(st.session_state.get("job_chunk_target_chars", 12000) * 0.85),
         )
+        st.session_state["job_safe_mode_reason"] = (
+            f"high_batch_shape_error_rate ({recent[-1]*100:.1f}% >= {threshold*100:.1f}%)"
+        )
 
 
 def _render_performance_panel() -> None:
@@ -365,6 +452,12 @@ def _render_performance_panel() -> None:
     if events:
         st.caption("Recent OpenAI calls")
         st.dataframe(pd.DataFrame(events), width="stretch")
+    safe_reason = st.session_state.get("job_safe_mode_reason", "")
+    if safe_reason:
+        st.warning(f"Safe mode active: {safe_reason}")
+    alerts = st.session_state.get("job_alerts", [])
+    if alerts:
+        st.error("Alerts: " + " | ".join(alerts))
 
 
 
@@ -422,6 +515,12 @@ def _job_reset() -> None:
         "job_checkpoint_every_batches",
         "job_adaptive_parallel_current",
         "job_fallback_rate_history",
+        "job_run_id",
+        "job_run_gate_passed",
+        "job_run_gate_reasons",
+        "job_publish_blocked_reason",
+        "job_alerts",
+        "job_safe_mode_reason",
     ]:
         st.session_state.pop(key, None)
 
@@ -441,6 +540,7 @@ def _build_tasks(df: pd.DataFrame, translate_columns: list[str], skip_columns: l
 def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: list[str], skip_columns: list[str]) -> None:
     st.session_state.job_active = True
     st.session_state.job_status = "running"
+    st.session_state.job_run_id = str(uuid4())
     st.session_state.job_df_out = df.copy()
     st.session_state.job_report = []
     st.session_state.job_quality_report = []
@@ -485,6 +585,11 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
         min(RUNTIME_CONFIG.batch_max_parallel, int(settings.get("max_parallel_requests", 1))),
     )
     st.session_state.job_fallback_rate_history = []
+    st.session_state.job_run_gate_passed = False
+    st.session_state.job_run_gate_reasons = []
+    st.session_state.job_publish_blocked_reason = ""
+    st.session_state.job_alerts = []
+    st.session_state.job_safe_mode_reason = ""
 
 
 def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
@@ -527,7 +632,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     for segment, complexity in all_segments:
         cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
         if cached is not None:
-            if revalidate_cache_hits_quality_gate:
+            should_revalidate = revalidate_cache_hits_quality_gate or _should_revalidate_cache_hit(segment, complexity)
+            if should_revalidate:
                 cached_quality = assess_translation_quality(
                     segment,
                     cached,
@@ -655,6 +761,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     _autotune_chunk_target(provider)
     _autotune_parallelism(provider)
     _apply_safe_mode_guard()
+    _emit_run_telemetry("checkpoint")
 
     for record in task_records:
         row_idx = record["row_idx"]
@@ -738,6 +845,12 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             build_validation_bundle_zip=_build_validation_bundle_zip,
             include_validation_bundle=st.session_state.job_status == "completed",
         )
+    if st.session_state.job_status == "completed":
+        _emit_run_telemetry("completed")
+        if not bool(st.session_state.get("job_run_gate_passed", False)):
+            st.session_state["job_publish_blocked_reason"] = ", ".join(
+                st.session_state.get("job_run_gate_reasons", [])
+            ) or "run_gate_failed"
 
 
 def _build_shoptet_client(prefix: str) -> ShoptetClient:
@@ -848,7 +961,7 @@ def main() -> None:
     skip_codes = st.checkbox("SKU/EAN/kódy neměnit", value=True)
     skip_units = st.checkbox("Jednotky neměnit", value=True)
     keep_unsafe = st.checkbox("Keep translated anyway (unsafe)", value=False)
-    revalidate_cache_hits_quality_gate = st.checkbox("Revalidovat cache hity quality gate", value=False)
+    revalidate_cache_hits_quality_gate = st.checkbox("Revalidovat cache hity quality gate", value=True)
     glossary_json = st.text_area("Glossary JSON", value='{}')
 
     col_start, col_pause, col_resume, col_stop = st.columns(4)
@@ -918,6 +1031,12 @@ def main() -> None:
     if st.session_state.get("job_status") == "completed":
         _render_performance_panel()
         st.success("Překlad dokončen")
+        gate_passed = bool(st.session_state.get("job_run_gate_passed", False))
+        gate_reasons = st.session_state.get("job_run_gate_reasons", [])
+        if gate_passed:
+            st.success("Run gate: PASS")
+        else:
+            st.error("Run gate: FAIL" + (f" ({', '.join(gate_reasons)})" if gate_reasons else ""))
         st.download_button("Stáhnout translated.csv", data=BytesIO(st.session_state.job_translated_csv), file_name="translated.csv", mime="text/csv")
         st.download_button("Stáhnout translation_report.csv", data=BytesIO(st.session_state.job_report_csv), file_name="translation_report.csv", mime="text/csv")
         st.download_button("Stáhnout translation_cache.json", data=BytesIO(st.session_state.job_cache_json), file_name="translation_cache.json", mime="application/json")
@@ -927,8 +1046,16 @@ def main() -> None:
 
         if st.session_state.job_settings.get("source_mode") == "Shoptet API":
             st.subheader("Update SK produktů podle EAN")
+            if not gate_passed:
+                st.warning(
+                    "Publish blocked: run-level quality gate failed. "
+                    + (f"Důvody: {', '.join(gate_reasons)}" if gate_reasons else "")
+                )
             if st.button("Update SK verzi (PATCH podle EAN)"):
                 try:
+                    if not gate_passed:
+                        st.error("SK update zablokován run-level quality gate pravidly.")
+                        return
                     sk_client = _build_shoptet_client("sk")
                     sync_errors: list[dict[str, Any]] = []
                     updated, missing = sync_translated_to_sk(
@@ -937,8 +1064,16 @@ def main() -> None:
                         columns_to_sync=st.session_state.job_settings["translate_columns"],
                         ean_field=st.session_state["api_ean_field"],
                         report_errors=sync_errors,
+                        max_error_ratio=RUNTIME_CONFIG.sync_max_error_ratio,
                     )
+                    sk_metrics = sk_client.get_metrics_snapshot()
                     st.success(f"SK update hotov: updated={updated}, missing_ean={missing}")
+                    sync_error_ratio = float(sk_metrics.get("error_ratio", 0.0))
+                    if sync_error_ratio > float(RUNTIME_CONFIG.sync_max_error_ratio):
+                        st.error(
+                            f"SK sync error ratio too high ({sync_error_ratio:.2%}); "
+                            f"threshold {RUNTIME_CONFIG.sync_max_error_ratio:.2%}"
+                        )
                     if sync_errors:
                         st.dataframe(pd.DataFrame(sync_errors), width="stretch")
                 except Exception as exc:
