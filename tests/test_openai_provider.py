@@ -75,3 +75,34 @@ def test_get_metrics_snapshot_exposes_events(monkeypatch) -> None:
     assert metrics["translate_calls_total"] == 1
     assert metrics["events_count"] == 1
     assert metrics["events"][0]["mode"] == "batch"
+
+
+def test_translate_text_chunks_parallel_batch_preserves_order(monkeypatch) -> None:
+    provider = _provider_stub()
+    provider.use_batch_api = True
+
+    async def fake_batch_chunks(chunks, source_lang, target_lang):
+        return [[f"tr:{v}" for v in chunk] for chunk in chunks]
+
+    monkeypatch.setattr(provider, "_translate_batch_chunks_async", fake_batch_chunks)
+
+    out = provider.translate_text_chunks([["a", "b"], ["c"]], "cs", "sk")
+
+    assert out == [["tr:a", "tr:b"], ["tr:c"]]
+    metrics = provider.get_metrics_snapshot()
+    assert metrics["events"][0]["mode"] == "batch_parallel"
+
+
+def test_translate_text_chunks_fallbacks_to_per_chunk(monkeypatch) -> None:
+    provider = _provider_stub()
+    provider.use_batch_api = True
+
+    async def failing_batch_chunks(chunks, source_lang, target_lang):
+        raise RuntimeError("batch_invalid_shape: x")
+
+    monkeypatch.setattr(provider, "_translate_batch_chunks_async", failing_batch_chunks)
+    monkeypatch.setattr(provider, "translate_texts", lambda texts, source_lang, target_lang: [f"fallback:{t}" for t in texts])
+
+    out = provider.translate_text_chunks([["a", "b"], ["c"]], "cs", "sk")
+
+    assert out == [["fallback:a", "fallback:b"], ["fallback:c"]]

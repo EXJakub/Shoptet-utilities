@@ -160,6 +160,79 @@ class OpenAIProvider(TranslationProvider):
         tasks = [self._one_async(text, source_lang, target_lang, sem) for text in texts]
         return await asyncio.gather(*tasks)
 
+
+    async def _translate_batch_chunks_async(
+        self,
+        text_chunks: list[list[str]],
+        source_lang: str,
+        target_lang: str,
+    ) -> list[list[str]]:
+        sem = asyncio.Semaphore(self.max_parallel_requests)
+
+        async def one_chunk(chunk: list[str]) -> list[str]:
+            async with sem:
+                if not chunk:
+                    return []
+                system_prompt = (
+                    "You are a precise translation engine. Translate each input item from source language to target language. "
+                    "Do not add markup or extra commentary. Preserve URLs, emails, product codes, identifiers, and units exactly. "
+                    "Return ONLY valid JSON array of translated strings in the same order and same length as input."
+                )
+                user_payload = {
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
+                    "texts": chunk,
+                }
+                payload = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                ]
+                raw = await self._retry_call_async(payload)
+                return _coerce_batch_response(raw, expected_len=len(chunk))
+
+        tasks = [one_chunk(chunk) for chunk in text_chunks]
+        return await asyncio.gather(*tasks)
+
+    def translate_text_chunks(self, text_chunks: list[list[str]], source_lang: str, target_lang: str) -> list[list[str]]:
+        if not text_chunks:
+            return []
+
+        if not self.use_batch_api:
+            return [self.translate_texts(chunk, source_lang, target_lang) for chunk in text_chunks]
+
+        total_count = sum(len(chunk) for chunk in text_chunks)
+        total_chars = sum(len(item) for chunk in text_chunks for item in chunk)
+        self._translate_calls_total += len(text_chunks)
+        started = time.perf_counter()
+        try:
+            translated_chunks = asyncio.run(self._translate_batch_chunks_async(text_chunks, source_lang, target_lang))
+            self._record_event(
+                OpenAICallEvent(
+                    mode="batch_parallel",
+                    input_count=total_count,
+                    input_chars=total_chars,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    success=True,
+                )
+            )
+            return translated_chunks
+        except RuntimeError as exc:
+            if str(exc).startswith("batch_"):
+                self._record_event(
+                    OpenAICallEvent(
+                        mode="batch_parallel",
+                        input_count=total_count,
+                        input_chars=total_chars,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        success=False,
+                        error_type=str(exc).split(":", 1)[0],
+                        fallback_used=True,
+                    )
+                )
+                logger.warning("Parallel batch translation failed (%s), falling back to per-chunk translate_texts.", exc)
+                return [self.translate_texts(chunk, source_lang, target_lang) for chunk in text_chunks]
+            raise
+
     def _batch(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
         if not texts:
             return []

@@ -294,8 +294,13 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         target_chars = int(st.session_state.get("job_chunk_target_chars", 12000))
         miss_chunks = _chunk_by_char_budget(unique_misses, target_chars=target_chars)
         st.session_state.job_perf["chunks_sent"] += len(miss_chunks)
-        for miss_chunk in miss_chunks:
-            translated = provider.translate_texts(miss_chunk, source_lang, target_lang)
+        translate_chunks = getattr(provider, "translate_text_chunks", None)
+        if callable(translate_chunks):
+            translated_chunks = translate_chunks(miss_chunks, source_lang, target_lang)
+        else:
+            translated_chunks = [provider.translate_texts(chunk, source_lang, target_lang) for chunk in miss_chunks]
+
+        for miss_chunk, translated in zip(miss_chunks, translated_chunks):
             for orig, tr in zip(miss_chunk, translated):
                 fixed = glossary.get(tr, tr)
                 cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
