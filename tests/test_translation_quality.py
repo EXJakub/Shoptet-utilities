@@ -1,4 +1,4 @@
-from translation_quality import assess_translation_quality
+from translation_quality import assess_translation_quality, is_legit_unchanged
 
 
 def test_cs_sk_detects_unchanged_long_text() -> None:
@@ -19,3 +19,14 @@ def test_quality_gate_is_noop_for_other_pairs() -> None:
 
     assert out.ok is True
     assert out.code == "ok"
+
+
+def test_legit_unchanged_url_is_allowed() -> None:
+    out = assess_translation_quality("https://example.com/product?id=123", "https://example.com/product?id=123", "cs", "sk")
+    assert out.ok is True
+    assert is_legit_unchanged("https://example.com/product?id=123", "https://example.com/product?id=123") is True
+
+
+def test_long_natural_language_unchanged_is_not_legit() -> None:
+    text = "Tento produkt je pouze skladem na centrálním skladu"
+    assert is_legit_unchanged(text, text) is False

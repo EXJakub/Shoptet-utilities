@@ -165,18 +165,23 @@ class OpenAIProvider(TranslationProvider):
                 await asyncio.sleep(delay)
         raise RuntimeError(f"retry_exhausted: {last_err}")
 
-    def _one_payload(self, text: str, source_lang: str, target_lang: str) -> list[dict[str, str]]:
+    def _one_payload(self, text: str, source_lang: str, target_lang: str, strict_change: bool = False) -> list[dict[str, str]]:
         system_prompt = (
             "You are a precise translation engine. "
             "Translate only natural language from source to target. "
             "Do not add markup. Preserve URLs, emails, codes, product numbers, units, and placeholders like __KEEP_0__ exactly. "
             "Return only translated text."
         )
+        if strict_change:
+            system_prompt += (
+                " If source_lang and target_lang are different and the input contains translatable natural language, "
+                "do not return an unchanged copy. Keep non-translatable tokens exactly, but translate surrounding language."
+            )
         user_prompt = f"source_lang={source_lang}\ntarget_lang={target_lang}\ntext:\n{text}"
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
-    def _batch_system_prompt(self) -> str:
-        return (
+    def _batch_system_prompt(self, strict_change: bool = False) -> str:
+        prompt = (
             "Translate each item from source_lang to target_lang. "
             "Input is a JSON array of objects in shape {id,text}. "
             "For each item: preserve meaning and tone; do not add markup, wrappers, explanations, or commentary. "
@@ -185,15 +190,27 @@ class OpenAIProvider(TranslationProvider):
             "Output requirements: return ONLY a valid JSON array of objects with shape {id,translated}. "
             "IDs must be copied exactly from input. No markdown fences. No wrapper objects."
         )
+        if strict_change:
+            prompt += (
+                " For each item containing translatable natural language where source_lang != target_lang, "
+                "the translated field must not be an unchanged copy of the input text."
+            )
+        return prompt
 
-    def _batch_payload(self, items: list[BatchItem], source_lang: str, target_lang: str) -> list[dict[str, str]]:
+    def _batch_payload(
+        self,
+        items: list[BatchItem],
+        source_lang: str,
+        target_lang: str,
+        strict_change: bool = False,
+    ) -> list[dict[str, str]]:
         user_payload = {
             "source_lang": source_lang,
             "target_lang": target_lang,
             "items": [{"id": item.id, "text": item.text} for item in items],
         }
         return [
-            {"role": "system", "content": self._batch_system_prompt()},
+            {"role": "system", "content": self._batch_system_prompt(strict_change=strict_change)},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
 
@@ -207,14 +224,26 @@ class OpenAIProvider(TranslationProvider):
         tasks = [self._one_async(text, source_lang, target_lang, sem) for text in texts]
         return await asyncio.gather(*tasks)
 
-    async def _translate_items_batch_once(self, items: list[BatchItem], source_lang: str, target_lang: str) -> dict[str, str]:
-        payload = self._batch_payload(items, source_lang, target_lang)
+    async def _translate_items_batch_once(
+        self,
+        items: list[BatchItem],
+        source_lang: str,
+        target_lang: str,
+        strict_change: bool = False,
+    ) -> dict[str, str]:
+        payload = self._batch_payload(items, source_lang, target_lang, strict_change=strict_change)
         raw = await self._retry_call_async(payload)
         return _coerce_batch_response(raw, expected_order=[item.id for item in items])
 
-    async def _translate_item_with_isolation(self, item: BatchItem, source_lang: str, target_lang: str) -> str:
+    async def _translate_item_with_isolation(
+        self,
+        item: BatchItem,
+        source_lang: str,
+        target_lang: str,
+        strict_change: bool = False,
+    ) -> str:
         self._isolated_item_fallback_count += 1
-        payload = self._one_payload(item.text, source_lang, target_lang)
+        payload = self._one_payload(item.text, source_lang, target_lang, strict_change=strict_change)
         return await self._retry_call_async(payload)
 
     async def _translate_items_with_recovery(
@@ -222,6 +251,7 @@ class OpenAIProvider(TranslationProvider):
         items: list[BatchItem],
         source_lang: str,
         target_lang: str,
+        strict_change: bool = False,
     ) -> dict[str, str]:
         pending = list(items)
         resolved: dict[str, str] = {}
@@ -229,7 +259,12 @@ class OpenAIProvider(TranslationProvider):
         while pending and attempts <= self.partial_recovery_max_attempts:
             attempts += 1
             try:
-                partial = await self._translate_items_batch_once(pending, source_lang, target_lang)
+                partial = await self._translate_items_batch_once(
+                    pending,
+                    source_lang,
+                    target_lang,
+                    strict_change=strict_change,
+                )
             except RuntimeError as exc:
                 if not str(exc).startswith("batch_"):
                     raise
@@ -249,13 +284,28 @@ class OpenAIProvider(TranslationProvider):
 
         if len(pending) == 1:
             item = pending[0]
-            resolved[item.id] = await self._translate_item_with_isolation(item, source_lang, target_lang)
+            resolved[item.id] = await self._translate_item_with_isolation(
+                item,
+                source_lang,
+                target_lang,
+                strict_change=strict_change,
+            )
             return resolved
 
         # Granular fallback: recursively split only problematic subset.
         mid = len(pending) // 2
-        left = await self._translate_items_with_recovery(pending[:mid], source_lang, target_lang)
-        right = await self._translate_items_with_recovery(pending[mid:], source_lang, target_lang)
+        left = await self._translate_items_with_recovery(
+            pending[:mid],
+            source_lang,
+            target_lang,
+            strict_change=strict_change,
+        )
+        right = await self._translate_items_with_recovery(
+            pending[mid:],
+            source_lang,
+            target_lang,
+            strict_change=strict_change,
+        )
         resolved.update(left)
         resolved.update(right)
         return resolved
@@ -265,6 +315,7 @@ class OpenAIProvider(TranslationProvider):
         text_chunks: list[list[str]],
         source_lang: str,
         target_lang: str,
+        strict_change: bool = False,
     ) -> list[list[str]]:
         sem = asyncio.Semaphore(self.max_parallel_requests)
 
@@ -273,13 +324,24 @@ class OpenAIProvider(TranslationProvider):
                 if not chunk:
                     return []
                 items = [BatchItem(id=f"c{chunk_idx}_i{i}", text=text) for i, text in enumerate(chunk)]
-                resolved = await self._translate_items_with_recovery(items, source_lang, target_lang)
+                resolved = await self._translate_items_with_recovery(
+                    items,
+                    source_lang,
+                    target_lang,
+                    strict_change=strict_change,
+                )
                 return [resolved[item.id] for item in items]
 
         tasks = [one_chunk(chunk, idx) for idx, chunk in enumerate(text_chunks)]
         return await asyncio.gather(*tasks)
 
-    def translate_text_chunks(self, text_chunks: list[list[str]], source_lang: str, target_lang: str) -> list[list[str]]:
+    def translate_text_chunks(
+        self,
+        text_chunks: list[list[str]],
+        source_lang: str,
+        target_lang: str,
+        strict_change: bool = False,
+    ) -> list[list[str]]:
         if not text_chunks:
             return []
         if not self.use_batch_api:
@@ -292,7 +354,14 @@ class OpenAIProvider(TranslationProvider):
         baseline_isolations = self._isolated_item_fallback_count
         started = time.perf_counter()
         try:
-            translated_chunks = asyncio.run(self._translate_batch_chunks_async(text_chunks, source_lang, target_lang))
+            translated_chunks = asyncio.run(
+                self._translate_batch_chunks_async(
+                    text_chunks,
+                    source_lang,
+                    target_lang,
+                    strict_change=strict_change,
+                )
+            )
             self._record_event(
                 OpenAICallEvent(
                     mode="batch_parallel",
@@ -322,25 +391,36 @@ class OpenAIProvider(TranslationProvider):
                     )
                 )
                 logger.warning("Parallel batch translation failed (%s), falling back to per-chunk translate_texts.", exc)
-                return [self.translate_texts(chunk, source_lang, target_lang) for chunk in text_chunks]
+                return [
+                    self.translate_texts(chunk, source_lang, target_lang, strict_change=strict_change)
+                    for chunk in text_chunks
+                ]
             raise
 
-    def _batch(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
+    def _batch(self, texts: list[str], source_lang: str, target_lang: str, strict_change: bool = False) -> list[str]:
         if not texts:
             return []
         items = [BatchItem(id=f"i{i}", text=text) for i, text in enumerate(texts)]
-        payload = self._batch_payload(items, source_lang, target_lang)
+        payload = self._batch_payload(items, source_lang, target_lang, strict_change=strict_change)
         raw = self._retry_call(payload)
         mapping = _coerce_batch_response(raw, expected_order=[item.id for item in items])
         missing = [item for item in items if item.id not in mapping]
         if missing:
             self._partial_recovery_count += 1
             for item in missing:
-                mapping[item.id] = self._retry_call(self._one_payload(item.text, source_lang, target_lang))
+                mapping[item.id] = self._retry_call(
+                    self._one_payload(item.text, source_lang, target_lang, strict_change=strict_change)
+                )
                 self._isolated_item_fallback_count += 1
         return [mapping[item.id] for item in items]
 
-    def translate_texts(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
+    def translate_texts(
+        self,
+        texts: list[str],
+        source_lang: str,
+        target_lang: str,
+        strict_change: bool = False,
+    ) -> list[str]:
         if not texts:
             return []
 
@@ -353,7 +433,7 @@ class OpenAIProvider(TranslationProvider):
             baseline_isolations = self._isolated_item_fallback_count
             started = time.perf_counter()
             try:
-                translated = self._batch(texts, source_lang, target_lang)
+                translated = self._batch(texts, source_lang, target_lang, strict_change=strict_change)
                 self._record_event(
                     OpenAICallEvent(
                         mode="batch",

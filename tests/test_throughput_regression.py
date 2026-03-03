@@ -57,6 +57,7 @@ def test_run_metrics_use_quality_sample_denominator_and_split_latency() -> None:
         "job_perf": {
             "quality_fail_count": 4,
             "quality_segments_total": 40,
+            "cell_reject_count": 2,
             "error_count": 1,
             "batch_shape_error_rate": 0.1,
             "effective_tpm_estimate": 1200,
@@ -72,3 +73,4 @@ def test_run_metrics_use_quality_sample_denominator_and_split_latency() -> None:
     assert metrics["recent_p95_latency_ms"] == 2000.0
     assert metrics["run_p95_latency_ms"] == 9000.0
     assert metrics["p95_latency_ms"] == metrics["run_p95_latency_ms"]
+    assert metrics["cell_reject_ratio"] == 0.2

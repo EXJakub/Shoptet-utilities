@@ -86,7 +86,7 @@ def test_translate_text_chunks_parallel_batch_preserves_order(monkeypatch) -> No
     provider = _provider_stub()
     provider.use_batch_api = True
 
-    async def fake_batch_chunks(chunks, source_lang, target_lang):
+    async def fake_batch_chunks(chunks, source_lang, target_lang, strict_change=False):
         return [[f"tr:{v}" for v in chunk] for chunk in chunks]
 
     monkeypatch.setattr(provider, "_translate_batch_chunks_async", fake_batch_chunks)
@@ -102,11 +102,15 @@ def test_translate_text_chunks_fallbacks_to_per_chunk(monkeypatch) -> None:
     provider = _provider_stub()
     provider.use_batch_api = True
 
-    async def failing_batch_chunks(chunks, source_lang, target_lang):
+    async def failing_batch_chunks(chunks, source_lang, target_lang, strict_change=False):
         raise RuntimeError("batch_invalid_shape: x")
 
     monkeypatch.setattr(provider, "_translate_batch_chunks_async", failing_batch_chunks)
-    monkeypatch.setattr(provider, "translate_texts", lambda texts, source_lang, target_lang: [f"fallback:{t}" for t in texts])
+    monkeypatch.setattr(
+        provider,
+        "translate_texts",
+        lambda texts, source_lang, target_lang, strict_change=False: [f"fallback:{t}" for t in texts],
+    )
 
     out = provider.translate_text_chunks([["a", "b"], ["c"]], "cs", "sk")
 
@@ -124,6 +128,13 @@ def test_batch_payload_contains_strict_array_contract() -> None:
     assert "__KEEP_0__" in system_msg
 
 
+def test_strict_change_prompt_mentions_no_unchanged_copy() -> None:
+    provider = _provider_stub()
+    payload = provider._one_payload("Tento produkt je pouze online", "cs", "sk", strict_change=True)
+    system_msg = payload[0]["content"]
+    assert "do not return an unchanged copy" in system_msg
+
+
 def test_translate_items_with_recovery_resolves_missing_ids(monkeypatch) -> None:
     provider = _provider_stub()
 
@@ -134,7 +145,7 @@ def test_translate_items_with_recovery_resolves_missing_ids(monkeypatch) -> None
 
     calls = {"count": 0}
 
-    async def fake_once(items, source_lang, target_lang):
+    async def fake_once(items, source_lang, target_lang, strict_change=False):
         calls["count"] += 1
         if calls["count"] == 1:
             return {items[0].id: f"tr:{items[0].text}"}
