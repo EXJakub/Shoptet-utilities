@@ -170,6 +170,8 @@ class OpenAIProvider(TranslationProvider):
             "You are a precise translation engine. "
             "Translate only natural language from source to target. "
             "Do not add markup. Preserve URLs, emails, codes, product numbers, units, and placeholders like __KEEP_0__ exactly. "
+            "For closely related languages (for example Czech->Slovak), still translate lexical words; "
+            "do not keep Czech-only wording when a Slovak equivalent exists. "
             "Return only translated text."
         )
         if strict_change:
@@ -187,6 +189,8 @@ class OpenAIProvider(TranslationProvider):
             "For each item: preserve meaning and tone; do not add markup, wrappers, explanations, or commentary. "
             "Preserve URLs, emails, product codes, unique identifiers, units, and placeholders like __KEEP_0__ exactly. "
             "If part of an item is non-translatable, keep that part unchanged and translate the rest. "
+            "For closely related languages (for example Czech->Slovak), still translate lexical words and avoid Czech-only wording "
+            "when a Slovak equivalent exists. "
             "Output requirements: return ONLY a valid JSON array of objects with shape {id,translated}. "
             "IDs must be copied exactly from input. No markdown fences. No wrapper objects."
         )

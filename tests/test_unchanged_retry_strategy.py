@@ -26,3 +26,10 @@ def test_strict_retry_batch_prompt_contains_anti_unchanged_instruction() -> None
     provider = _provider_stub()
     prompt = provider._batch_system_prompt(strict_change=True)
     assert "must not be an unchanged copy" in prompt
+
+
+def test_batch_prompt_mentions_lexical_translation_for_close_languages() -> None:
+    provider = _provider_stub()
+    prompt = provider._batch_system_prompt(strict_change=False)
+    assert "closely related languages" in prompt
+    assert "Czech->Slovak" in prompt
