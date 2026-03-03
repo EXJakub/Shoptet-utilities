@@ -35,6 +35,7 @@ class TranslationPlan:
     original: str
     segments: list[str]
     restorers: list[dict[str, str]]
+    segment_meta: list[dict[str, Any]] | None = None
     soup: Any | None = None
     html_nodes: list[_HtmlNodePlan] | None = None
 
@@ -87,6 +88,15 @@ def _has_translatable_content(text: str) -> bool:
     return bool(re.search(r"[A-Za-zÀ-ž]", without_tokens))
 
 
+def segment_complexity_score(text: str, segment_type: str) -> float:
+    length_score = min(len(text) / 1500.0, 1.0)
+    html_score = min(len(HTML_TAG_RE.findall(text)) / 8.0, 1.0)
+    placeholders = len(PROTECTED_TOKEN_RE.findall(text))
+    token_score = min(placeholders / 10.0, 1.0)
+    mixed_markup_bonus = 0.2 if segment_type == "html" else 0.0
+    return min(1.0, 0.45 * length_score + 0.25 * html_score + 0.2 * token_score + mixed_markup_bonus)
+
+
 def split_long_text(text: str, max_chars: int) -> list[str]:
     if len(text) <= max_chars:
         return [text]
@@ -105,27 +115,29 @@ def split_long_text(text: str, max_chars: int) -> list[str]:
 
 def build_translation_plan(value: str | None, options: TranslationOptions, max_chars: int) -> TranslationPlan:
     if value is None:
-        return TranslationPlan(mode="skip", original="", segments=[], restorers=[])
+        return TranslationPlan(mode="skip", original="", segments=[], restorers=[], segment_meta=[])
 
     text = str(value)
     as_html = options.mode == "FORCE_HTML" or (options.mode == "AUTO" and is_html(text))
 
     if not as_html:
         if should_skip_text(text, options):
-            return TranslationPlan(mode="skip", original=text, segments=[], restorers=[])
+            return TranslationPlan(mode="skip", original=text, segments=[], restorers=[], segment_meta=[])
 
         protected, replacements = _protect_text(text, options)
         if not _has_translatable_content(protected):
-            return TranslationPlan(mode="skip", original=text, segments=[], restorers=[])
+            return TranslationPlan(mode="skip", original=text, segments=[], restorers=[], segment_meta=[])
 
         raw_segments = split_long_text(protected, max_chars=max_chars)
         restorers = [replacements for _ in raw_segments]
-        return TranslationPlan(mode="plain", original=text, segments=raw_segments, restorers=restorers)
+        meta = [{"segment_type": "plain", "complexity": segment_complexity_score(seg, "plain")} for seg in raw_segments]
+        return TranslationPlan(mode="plain", original=text, segments=raw_segments, restorers=restorers, segment_meta=meta)
 
     soup = BeautifulSoup(text, "lxml")
     html_nodes: list[_HtmlNodePlan] = []
     segments: list[str] = []
     restorers: list[dict[str, str]] = []
+    segment_meta: list[dict[str, Any]] = []
 
     for node in soup.find_all(string=True):
         parent_name = node.parent.name if node.parent else ""
@@ -142,12 +154,23 @@ def build_translation_plan(value: str | None, options: TranslationOptions, max_c
         node_segments = split_long_text(protected, max_chars=max_chars)
         segments.extend(node_segments)
         restorers.extend([replacements for _ in node_segments])
+        segment_meta.extend(
+            [{"segment_type": "html", "complexity": segment_complexity_score(seg, "html")} for seg in node_segments]
+        )
         html_nodes.append(_HtmlNodePlan(node=node, segment_count=len(node_segments)))
 
     if not segments:
-        return TranslationPlan(mode="skip", original=text, segments=[], restorers=[])
+        return TranslationPlan(mode="skip", original=text, segments=[], restorers=[], segment_meta=[])
 
-    return TranslationPlan(mode="html", original=text, segments=segments, restorers=restorers, soup=soup, html_nodes=html_nodes)
+    return TranslationPlan(
+        mode="html",
+        original=text,
+        segments=segments,
+        restorers=restorers,
+        segment_meta=segment_meta,
+        soup=soup,
+        html_nodes=html_nodes,
+    )
 
 
 def render_translation_plan(plan: TranslationPlan, translated_segments: list[str]) -> str:

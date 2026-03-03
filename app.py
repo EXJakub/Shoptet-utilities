@@ -7,17 +7,21 @@ import os
 import zipfile
 from io import BytesIO
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 from cache import TranslationCache
-from csv_io import CsvFormat, dataframe_to_csv_bytes, read_csv_from_upload
+from csv_io import CsvFormat, read_csv_from_upload
 from html_translate import HTML_TAG_RE, TranslationOptions, build_translation_plan, render_translation_plan
+from job_artifacts import should_checkpoint, write_job_artifacts
 from reporting import ReportRecord, make_record, report_to_dataframe
+from runtime_config import load_runtime_config, shoptet_from_session
 from shoptet_api import ShoptetClient, ShoptetConfig, sync_translated_to_sk
-from translation_quality import assess_translation_quality
+from telemetry import build_run_envelope, build_telemetry_exporter, evaluate_alerts, evaluate_run_gate
+from translation_quality import assess_translation_quality, is_legit_unchanged, quality_tier_for_segment
 from translator.base import TranslationProvider
 from translator.openai_provider import OpenAIProvider
 from validators import validate_hrefs, validate_structure
@@ -26,6 +30,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+RUNTIME_CONFIG = load_runtime_config()
+TELEMETRY_EXPORTER = build_telemetry_exporter(RUNTIME_CONFIG.telemetry_backend, RUNTIME_CONFIG.telemetry_jsonl_path)
 
 
 QUALITY_REPORT_COLUMNS = ["source_hash", "issue", "action", "message", "row_index", "column"]
@@ -33,7 +39,7 @@ QUALITY_REPORT_COLUMNS = ["source_hash", "issue", "action", "message", "row_inde
 
 def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_requests: int) -> TranslationProvider:
     if name == "OpenAI":
-        api_key = os.getenv("OPENAI_API_KEY", "")
+        api_key = RUNTIME_CONFIG.openai_api_key
         if not api_key:
             raise ValueError("Chybí OPENAI_API_KEY v .env.")
         return OpenAIProvider(
@@ -41,6 +47,7 @@ def get_provider(name: str, model: str, use_batch_api: bool, max_parallel_reques
             model=model,
             use_batch_api=use_batch_api,
             max_parallel_requests=max_parallel_requests,
+            partial_recovery_max_attempts=RUNTIME_CONFIG.batch_partial_recovery_max_attempts,
         )
     raise ValueError("Zvolený provider není implementovaný.")
 
@@ -66,7 +73,9 @@ def _append_job_report(record: ReportRecord) -> None:
 def _append_job_quality_record(record: dict[str, Any]) -> None:
     st.session_state.job_quality_report.append(record)
     issue = str(record.get("issue", "unknown"))
+    action = str(record.get("action", "unknown"))
     _increment_perf_counter("quality_issue_counts", issue)
+    _increment_perf_counter("quality_action_counts", action)
 
 
 def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dict[str, Any]:
@@ -83,6 +92,12 @@ def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dic
         report_counts = report_df["error_type"].value_counts().to_dict()
 
     return {
+        "run": {
+            "run_id": st.session_state.get("job_run_id"),
+            "gate_passed": bool(st.session_state.get("job_run_gate_passed", False)),
+            "gate_reasons": list(st.session_state.get("job_run_gate_reasons", [])),
+            "publish_blocked_reason": st.session_state.get("job_publish_blocked_reason", ""),
+        },
         "source_mode": settings.get("source_mode"),
         "provider": {
             "name": settings.get("provider_name"),
@@ -111,6 +126,7 @@ def _build_run_summary(source_df: pd.DataFrame, settings: dict[str, Any]) -> dic
             "issue_counts": quality_counts,
         },
         "performance": st.session_state.get("job_perf", {}),
+        "alerts": st.session_state.get("job_alerts", []),
     }
 
 
@@ -163,12 +179,205 @@ def _chunk_by_char_budget(texts: list[str], target_chars: int = 12000, max_items
     return chunks
 
 
+def _chunk_by_complexity_budget(
+    items: list[tuple[str, float]],
+    target_chars: int = 12000,
+    max_items: int = 128,
+) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_weighted_chars = 0.0
+    for text, complexity in items:
+        # High-complexity segments consume more budget to avoid unstable huge batches.
+        weighted = max(1.0, len(text) * (1.0 + complexity))
+        if current and (len(current) >= max_items or current_weighted_chars + weighted > target_chars):
+            chunks.append(current)
+            current = []
+            current_weighted_chars = 0.0
+        current.append(text)
+        current_weighted_chars += weighted
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 
 def _safe_provider_metrics(provider: TranslationProvider) -> dict[str, Any]:
     getter = getattr(provider, "get_metrics_snapshot", None)
     if callable(getter):
         return getter()
     return {}
+
+
+def _translate_chunks_with_policy(
+    provider: TranslationProvider,
+    chunks: list[list[str]],
+    source_lang: str,
+    target_lang: str,
+    *,
+    strict_change: bool = False,
+) -> list[list[str]]:
+    if not chunks:
+        return []
+    translate_chunks = getattr(provider, "translate_text_chunks", None)
+    if callable(translate_chunks):
+        if strict_change:
+            try:
+                return translate_chunks(chunks, source_lang, target_lang, strict_change=True)
+            except TypeError:
+                # Provider without policy support: use default behavior.
+                return translate_chunks(chunks, source_lang, target_lang)
+        return translate_chunks(chunks, source_lang, target_lang)
+
+    if strict_change:
+        translated: list[list[str]] = []
+        for chunk in chunks:
+            translate_texts = getattr(provider, "translate_texts")
+            try:
+                translated.append(translate_texts(chunk, source_lang, target_lang, strict_change=True))
+            except TypeError:
+                translated.append(translate_texts(chunk, source_lang, target_lang))
+        return translated
+    return [provider.translate_texts(chunk, source_lang, target_lang) for chunk in chunks]
+
+
+def _gate_thresholds() -> dict[str, float]:
+    return {
+        "quality_fail_ratio": float(RUNTIME_CONFIG.quality_gate_max_fail_ratio),
+        "provider_error_ratio": float(RUNTIME_CONFIG.quality_gate_max_provider_error_ratio),
+        "batch_shape_error_rate": float(RUNTIME_CONFIG.quality_gate_max_batch_shape_error_rate),
+        "p95_latency_ms": float(RUNTIME_CONFIG.quality_gate_max_p95_latency_ms),
+        "quality_fail_ratio_min_samples": float(RUNTIME_CONFIG.quality_gate_min_quality_samples),
+        "provider_error_ratio_min_samples": 1.0,
+        "batch_shape_error_rate_min_samples": float(RUNTIME_CONFIG.quality_gate_min_batch_shape_samples),
+        "p95_latency_ms_min_samples": float(RUNTIME_CONFIG.quality_gate_min_latency_samples),
+    }
+
+
+def _p95_latency(events: list[dict[str, Any]]) -> float:
+    if not events:
+        return 0.0
+    lat = sorted(max(0, int(e.get("latency_ms", 0))) for e in events)
+    if not lat:
+        return 0.0
+    idx = max(0, int(len(lat) * 0.95) - 1)
+    return float(lat[idx])
+
+
+def _build_quality_diagnostics(perf: dict[str, Any]) -> dict[str, Any]:
+    issue_counts = dict(perf.get("quality_issue_counts") or {})
+    action_counts = dict(perf.get("quality_action_counts") or {})
+    rows = st.session_state.get("job_quality_report", [])
+    column_counts: dict[str, int] = {}
+    unchanged_column_counts: dict[str, int] = {}
+    for row in rows:
+        col = str(row.get("column", "") or "").strip()
+        if not col:
+            continue
+        column_counts[col] = column_counts.get(col, 0) + 1
+        if str(row.get("issue", "")) == "unchanged_text":
+            unchanged_column_counts[col] = unchanged_column_counts.get(col, 0) + 1
+    top_columns = sorted(column_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+    top_unchanged_columns = sorted(unchanged_column_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+    return {
+        "quality_issue_counts": issue_counts,
+        "quality_action_counts": action_counts,
+        "top_quality_columns": [{"column": col, "count": count} for col, count in top_columns],
+        "top_unchanged_columns": [{"column": col, "count": count} for col, count in top_unchanged_columns],
+        "quality_retry_count": int(perf.get("quality_retry_count", 0)),
+        "quality_fail_count": int(perf.get("quality_fail_count", 0)),
+        "quality_sample_size": int(perf.get("quality_segments_total", 0)),
+        "cell_reject_count": int(perf.get("cell_reject_count", 0)),
+        "unchanged_retry_attempts": int(perf.get("unchanged_retry_attempts", 0)),
+        "unchanged_retry_fixed": int(perf.get("unchanged_retry_fixed", 0)),
+        "unchanged_retry_failed": int(perf.get("unchanged_retry_failed", 0)),
+        "legit_unchanged_count": int(perf.get("legit_unchanged_count", 0)),
+    }
+
+
+def _calc_run_metrics() -> dict[str, float]:
+    perf: dict[str, Any] = st.session_state.get("job_perf", {})
+    translated_cells = max(1, int(st.session_state.get("job_translated_count", 0)))
+    quality_samples = max(0, int(perf.get("quality_segments_total", 0)))
+    quality_fail = int(perf.get("quality_fail_count", 0))
+    cell_reject_count = int(perf.get("cell_reject_count", 0))
+    provider_errors = int(perf.get("error_count", 0))
+    recent_events = perf.get("last_events", [])
+    run_events = perf.get("run_events", [])
+    recent_p95_latency = _p95_latency(recent_events)
+    run_p95_latency = _p95_latency(run_events)
+    chunks_sent = max(0, int(perf.get("chunks_sent", 0)))
+    quality_fail_ratio = float(quality_fail / quality_samples) if quality_samples > 0 else 0.0
+    return {
+        "quality_fail_ratio": quality_fail_ratio,
+        "provider_error_ratio": provider_errors / translated_cells,
+        "batch_shape_error_rate": float(perf.get("batch_shape_error_rate", 0.0)),
+        "p95_latency_ms": run_p95_latency,
+        "recent_p95_latency_ms": recent_p95_latency,
+        "run_p95_latency_ms": run_p95_latency,
+        "effective_tpm_estimate": float(perf.get("effective_tpm_estimate", 0)),
+        "cells_per_min": float(
+            int(st.session_state.get("job_translated_count", 0))
+            / max(
+                0.1,
+                (pd.Timestamp.utcnow() - st.session_state.get("job_started_at", pd.Timestamp.utcnow())).total_seconds() / 60.0,
+            )
+        ),
+        "cache_hit_rate": float(
+            1.0
+            - (
+                int(perf.get("cache_misses_total", 0))
+                / max(1, int(perf.get("segments_total", 0)))
+            )
+        ),
+        "quality_sample_size": float(quality_samples),
+        "provider_error_sample_size": float(translated_cells),
+        "latency_sample_size": float(len(run_events)),
+        "batch_shape_sample_size": float(chunks_sent),
+        "cell_reject_ratio": float(cell_reject_count / max(1, translated_cells)),
+        "cell_reject_sample_size": float(translated_cells),
+    }
+
+
+def _emit_run_telemetry(phase: str) -> None:
+    metrics = _calc_run_metrics()
+    history = st.session_state.setdefault("job_quality_ratio_history", [])
+    history.append(
+        {
+            "ratio": float(metrics.get("quality_fail_ratio", 0.0)),
+            "sample_size": int(metrics.get("quality_sample_size", 0.0)),
+        }
+    )
+    history[:] = history[-10:]
+    thresholds = _gate_thresholds()
+    alerts = evaluate_alerts(metrics, thresholds)
+    gate_passed, gate_reasons = evaluate_run_gate(metrics, thresholds)
+    st.session_state["job_alerts"] = [a.message for a in alerts]
+    st.session_state["job_run_gate_passed"] = gate_passed
+    st.session_state["job_run_gate_reasons"] = gate_reasons
+
+    envelope = build_run_envelope(
+        run_id=str(st.session_state.get("job_run_id", "")),
+        phase=phase,
+        status=str(st.session_state.get("job_status", "")),
+        metrics=metrics,
+        alerts=alerts,
+        gate_passed=gate_passed,
+        gate_reasons=gate_reasons,
+        diagnostics=_build_quality_diagnostics(st.session_state.get("job_perf", {})),
+    )
+    TELEMETRY_EXPORTER.emit(envelope)
+
+
+def _should_revalidate_cache_hit(segment: str, complexity: float) -> bool:
+    if complexity >= 0.6:
+        return True
+    sample_rate = float(RUNTIME_CONFIG.cache_revalidation_low_risk_sample_rate)
+    if sample_rate <= 0:
+        return False
+    digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()
+    sample = (int(digest[:8], 16) % 10000) / 10000.0
+    return sample <= sample_rate
 
 
 def _update_job_perf_metrics(
@@ -193,8 +402,39 @@ def _update_job_perf_metrics(
             "latency_ms_total": 0,
             "input_chars_total": 0,
             "input_items_total": 0,
+            "batch_invalid_shape_count": 0,
+            "partial_recovery_count": 0,
+            "isolated_item_fallback_count": 0,
+            "effective_tpm_estimate": 0,
+            "batch_shape_error_rate": 0.0,
+            "adaptive_parallel_current": st.session_state.get("job_adaptive_parallel_current", 1),
+            "quality_segments_total": 0,
+            "cell_reject_count": 0,
+            "unchanged_retry_attempts": 0,
+            "unchanged_retry_fixed": 0,
+            "unchanged_retry_failed": 0,
+            "legit_unchanged_count": 0,
+            "run_events": [],
         },
     )
+    perf.setdefault("segments_total", 0)
+    perf.setdefault("cache_misses_total", 0)
+    perf.setdefault("unique_misses_total", 0)
+    perf.setdefault("chunks_sent", 0)
+    perf.setdefault("batch_invalid_shape_count", 0)
+    perf.setdefault("partial_recovery_count", 0)
+    perf.setdefault("isolated_item_fallback_count", 0)
+    perf.setdefault("effective_tpm_estimate", 0)
+    perf.setdefault("batch_shape_error_rate", 0.0)
+    perf.setdefault("adaptive_parallel_current", st.session_state.get("job_adaptive_parallel_current", 1))
+    perf.setdefault("quality_segments_total", 0)
+    perf.setdefault("cell_reject_count", 0)
+    perf.setdefault("unchanged_retry_attempts", 0)
+    perf.setdefault("unchanged_retry_fixed", 0)
+    perf.setdefault("unchanged_retry_failed", 0)
+    perf.setdefault("legit_unchanged_count", 0)
+    perf.setdefault("quality_action_counts", {})
+    perf.setdefault("run_events", [])
     perf["segments_total"] += total_segments
     perf["cache_misses_total"] += cache_misses
     perf["unique_misses_total"] += unique_misses
@@ -208,7 +448,16 @@ def _update_job_perf_metrics(
         perf["latency_ms_total"] = metrics.get("total_latency_ms", 0)
         perf["input_chars_total"] = metrics.get("total_input_chars", 0)
         perf["input_items_total"] = metrics.get("total_input_items", 0)
+        perf["batch_invalid_shape_count"] = metrics.get("batch_invalid_shape_count", 0)
+        perf["partial_recovery_count"] = metrics.get("partial_recovery_count", 0)
+        perf["isolated_item_fallback_count"] = metrics.get("isolated_item_fallback_count", 0)
         perf["last_events"] = metrics.get("events", [])[-20:]
+        perf["run_events"] = metrics.get("events", [])
+        elapsed_minutes = max(0.1, (pd.Timestamp.utcnow() - st.session_state.get("job_started_at", pd.Timestamp.utcnow())).total_seconds() / 60.0)
+        token_estimate = int(metrics.get("total_input_chars", 0) / 4)
+        perf["effective_tpm_estimate"] = int(token_estimate / elapsed_minutes)
+        chunks_sent = max(1, int(perf.get("chunks_sent", 0)))
+        perf["batch_shape_error_rate"] = float(perf.get("batch_invalid_shape_count", 0)) / chunks_sent
 
 
 def _autotune_chunk_target(provider: TranslationProvider) -> None:
@@ -223,14 +472,102 @@ def _autotune_chunk_target(provider: TranslationProvider) -> None:
     fallback_used = any(bool(e.get("fallback_used", False)) for e in recent)
 
     target = int(st.session_state.get("job_chunk_target_chars", 12000))
-    if recent_errors > 0 or fallback_used or avg_latency > 7500:
+    perf = st.session_state.setdefault("job_perf", {})
+    cooldown = int(RUNTIME_CONFIG.batch_autotune_cooldown_batches)
+    batch_idx = int(st.session_state.get("job_batch_index", 0))
+    last_batch = int(perf.get("autotune_last_chunk_batch", -999))
+    if batch_idx - last_batch <= cooldown:
+        return
+
+    downshift_threshold = int(RUNTIME_CONFIG.batch_chunk_downshift_avg_latency_ms)
+    upshift_threshold = int(RUNTIME_CONFIG.batch_chunk_upshift_avg_latency_ms)
+
+    if recent_errors > 0 or fallback_used or avg_latency > downshift_threshold:
         target = max(6000, int(target * 0.9))
-    elif avg_latency < 3000 and recent_errors == 0:
+    elif avg_latency < upshift_threshold and recent_errors == 0:
         target = min(20000, int(target * 1.05))
+    else:
+        return
 
     st.session_state.job_chunk_target_chars = target
-    if "job_perf" in st.session_state:
-        st.session_state.job_perf["chunk_target_chars"] = target
+    perf["chunk_target_chars"] = target
+    perf["autotune_last_chunk_batch"] = batch_idx
+
+
+def _autotune_parallelism(provider: TranslationProvider) -> None:
+    metrics = _safe_provider_metrics(provider)
+    events: list[dict[str, Any]] = metrics.get("events", [])
+    if not events:
+        return
+
+    recent = events[-8:]
+    p95_latency = sorted(int(e.get("latency_ms", 0)) for e in recent)[max(0, int(len(recent) * 0.95) - 1)]
+    recent_errors = sum(1 for e in recent if not e.get("success", True))
+    recent_fallbacks = sum(1 for e in recent if bool(e.get("fallback_used", False)))
+    settings = st.session_state.get("job_settings", {})
+    current = int(st.session_state.get("job_adaptive_parallel_current", settings.get("max_parallel_requests", 1)))
+
+    min_parallel = int(RUNTIME_CONFIG.batch_min_parallel)
+    max_parallel = int(min(RUNTIME_CONFIG.batch_max_parallel, settings.get("max_parallel_requests", 1)))
+    perf = st.session_state.setdefault("job_perf", {})
+    cooldown = int(RUNTIME_CONFIG.batch_autotune_cooldown_batches)
+    batch_idx = int(st.session_state.get("job_batch_index", 0))
+    last_batch = int(perf.get("autotune_last_parallel_batch", -999))
+    if batch_idx - last_batch <= cooldown:
+        return
+
+    downshift_threshold = int(RUNTIME_CONFIG.batch_parallel_downshift_p95_ms)
+    upshift_threshold = int(RUNTIME_CONFIG.batch_parallel_upshift_p95_ms)
+    quality_threshold = float(RUNTIME_CONFIG.quality_gate_max_fail_ratio)
+    quality_min_samples = int(RUNTIME_CONFIG.quality_gate_min_quality_samples)
+    quality_history = st.session_state.get("job_quality_ratio_history", [])
+    recent_quality = quality_history[-3:]
+    quality_downshift = (
+        len(recent_quality) == 3
+        and all(int(item.get("sample_size", 0)) >= quality_min_samples for item in recent_quality)
+        and all(float(item.get("ratio", 0.0)) >= quality_threshold for item in recent_quality)
+    )
+    quality_upshift_ok = (
+        len(recent_quality) == 3
+        and all(int(item.get("sample_size", 0)) >= quality_min_samples for item in recent_quality)
+        and all(float(item.get("ratio", 0.0)) <= (quality_threshold * 0.5) for item in recent_quality)
+    )
+
+    if recent_errors > 0 or recent_fallbacks > 0 or p95_latency > downshift_threshold or quality_downshift:
+        current = max(min_parallel, max(1, current // 2))
+    elif p95_latency < upshift_threshold and recent_errors == 0 and recent_fallbacks == 0 and quality_upshift_ok:
+        current = min(max_parallel, current + 1)
+    else:
+        return
+    st.session_state["job_adaptive_parallel_current"] = current
+    perf["adaptive_parallel_current"] = current
+    perf["autotune_last_parallel_batch"] = batch_idx
+
+
+def _apply_safe_mode_guard() -> None:
+    history: list[float] = st.session_state.setdefault("job_fallback_rate_history", [])
+    perf: dict[str, Any] = st.session_state.get("job_perf", {})
+    shape_errors = int(perf.get("batch_invalid_shape_count", 0))
+    chunks_sent = int(perf.get("chunks_sent", 0))
+    fallback_rate = (shape_errors / chunks_sent) if chunks_sent > 0 else 0.0
+    history.append(fallback_rate)
+    history[:] = history[-6:]
+    if len(history) < 3:
+        return
+    recent = history[-3:]
+    threshold = float(RUNTIME_CONFIG.batch_safe_mode_fallback_threshold)
+    if all(rate >= threshold for rate in recent):
+        st.session_state["job_adaptive_parallel_current"] = max(
+            int(RUNTIME_CONFIG.batch_min_parallel),
+            int(st.session_state.get("job_adaptive_parallel_current", 1)) // 2,
+        )
+        st.session_state["job_chunk_target_chars"] = max(
+            6000,
+            int(st.session_state.get("job_chunk_target_chars", 12000) * 0.85),
+        )
+        st.session_state["job_safe_mode_reason"] = (
+            f"high_batch_shape_error_rate ({recent[-1]*100:.1f}% >= {threshold*100:.1f}%)"
+        )
 
 
 def _render_performance_panel() -> None:
@@ -258,10 +595,36 @@ def _render_performance_panel() -> None:
     cols2[2].metric("Unique misses", str(unique_misses))
     cols2[3].metric("Provider errors", str(perf.get("error_count", 0)))
 
+    cols3 = st.columns(4)
+    cols3[0].metric("Estimated TPM", str(perf.get("effective_tpm_estimate", 0)))
+    cols3[1].metric("Batch shape error rate", f"{float(perf.get('batch_shape_error_rate', 0.0))*100:.1f}%")
+    cols3[2].metric("Adaptive parallel", str(perf.get("adaptive_parallel_current", 0)))
+    cols3[3].metric("Partial recoveries", str(perf.get("partial_recovery_count", 0)))
+
+    run_p95 = _p95_latency(perf.get("run_events", []))
+    recent_p95 = _p95_latency(perf.get("last_events", []))
+    cols4 = st.columns(3)
+    cols4[0].metric("Run P95 latency (ms)", f"{run_p95:.0f}")
+    cols4[1].metric("Recent P95 latency (ms)", f"{recent_p95:.0f}")
+    cols4[2].metric("Quality sample size", str(perf.get("quality_segments_total", 0)))
+
+    translated_cells = max(1, int(st.session_state.get("job_translated_count", 0)))
+    cell_reject_ratio = int(perf.get("cell_reject_count", 0)) / translated_cells
+    cols5 = st.columns(3)
+    cols5[0].metric("Cell reject ratio", f"{cell_reject_ratio*100:.1f}%")
+    cols5[1].metric("Unchanged retry fixed", str(perf.get("unchanged_retry_fixed", 0)))
+    cols5[2].metric("Legit unchanged", str(perf.get("legit_unchanged_count", 0)))
+
     events = perf.get("last_events", [])
     if events:
         st.caption("Recent OpenAI calls")
         st.dataframe(pd.DataFrame(events), width="stretch")
+    safe_reason = st.session_state.get("job_safe_mode_reason", "")
+    if safe_reason:
+        st.warning(f"Safe mode active: {safe_reason}")
+    alerts = st.session_state.get("job_alerts", [])
+    if alerts:
+        st.error("Alerts: " + " | ".join(alerts))
 
 
 
@@ -315,6 +678,17 @@ def _job_reset() -> None:
         "job_started_at",
         "job_validation_summary_json",
         "job_validation_bundle_zip",
+        "job_batch_index",
+        "job_checkpoint_every_batches",
+        "job_adaptive_parallel_current",
+        "job_fallback_rate_history",
+        "job_run_id",
+        "job_run_gate_passed",
+        "job_run_gate_reasons",
+        "job_publish_blocked_reason",
+        "job_alerts",
+        "job_safe_mode_reason",
+        "job_quality_ratio_history",
     ]:
         st.session_state.pop(key, None)
 
@@ -334,6 +708,7 @@ def _build_tasks(df: pd.DataFrame, translate_columns: list[str], skip_columns: l
 def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: list[str], skip_columns: list[str]) -> None:
     st.session_state.job_active = True
     st.session_state.job_status = "running"
+    st.session_state.job_run_id = str(uuid4())
     st.session_state.job_df_out = df.copy()
     st.session_state.job_report = []
     st.session_state.job_quality_report = []
@@ -360,11 +735,40 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
         "input_items_total": 0,
         "quality_retry_count": 0,
         "quality_fail_count": 0,
+        "quality_segments_total": 0,
+        "cell_reject_count": 0,
+        "unchanged_retry_attempts": 0,
+        "unchanged_retry_fixed": 0,
+        "unchanged_retry_failed": 0,
+        "legit_unchanged_count": 0,
+        "batch_invalid_shape_count": 0,
+        "partial_recovery_count": 0,
+        "isolated_item_fallback_count": 0,
+        "effective_tpm_estimate": 0,
+        "batch_shape_error_rate": 0.0,
+        "adaptive_parallel_current": st.session_state.get("job_adaptive_parallel_current", 0),
         "translation_error_type_counts": {},
         "quality_issue_counts": {},
+        "quality_action_counts": {},
+        "run_events": [],
+        "autotune_last_parallel_batch": -999,
+        "autotune_last_chunk_batch": -999,
     }
     st.session_state.job_validation_summary_json = b""
     st.session_state.job_validation_bundle_zip = b""
+    st.session_state.job_batch_index = 0
+    st.session_state.job_checkpoint_every_batches = RUNTIME_CONFIG.checkpoint_every_batches
+    st.session_state.job_adaptive_parallel_current = max(
+        RUNTIME_CONFIG.batch_min_parallel,
+        min(RUNTIME_CONFIG.batch_max_parallel, int(settings.get("max_parallel_requests", 1))),
+    )
+    st.session_state.job_fallback_rate_history = []
+    st.session_state.job_run_gate_passed = False
+    st.session_state.job_run_gate_reasons = []
+    st.session_state.job_publish_blocked_reason = ""
+    st.session_state.job_alerts = []
+    st.session_state.job_safe_mode_reason = ""
+    st.session_state.job_quality_ratio_history = []
 
 
 def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
@@ -373,6 +777,9 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
     settings: dict[str, Any] = st.session_state.job_settings
     provider = _get_provider_for_job(settings)
+    adaptive_parallel = int(st.session_state.get("job_adaptive_parallel_current", settings.get("max_parallel_requests", 1)))
+    if hasattr(provider, "max_parallel_requests"):
+        provider.max_parallel_requests = max(1, adaptive_parallel)
     options = TranslationOptions(**settings["translation_options"])
     glossary: dict[str, str] = settings["glossary"]
     source_lang = settings["source_lang"]
@@ -387,22 +794,38 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     end_cursor = min(st.session_state.job_cursor + per_run_cells, len(tasks))
 
     task_records: list[dict[str, Any]] = []
-    all_segments: list[str] = []
+    all_segments: list[tuple[str, float, str]] = []
     for idx in range(st.session_state.job_cursor, end_cursor):
         row_idx, col = tasks[idx]
         source = str(source_df.at[row_idx, col] or "")
         plan = build_translation_plan(source, options, max_chars=max_chars)
         task_records.append({"row_idx": row_idx, "col": col, "source": source, "plan": plan})
-        all_segments.extend(plan.segments)
+        plan_mode = getattr(plan, "mode", "plain")
+        segment_meta = getattr(plan, "segment_meta", None) or [{"segment_type": plan_mode, "complexity": 0.2} for _ in plan.segments]
+        for segment, meta in zip(plan.segments, segment_meta):
+            all_segments.append(
+                (
+                    segment,
+                    float(meta.get("complexity", 0.2)),
+                    str(meta.get("segment_type", plan_mode) or plan_mode),
+                )
+            )
 
-    unique_misses: list[str] = []
-    unique_seen: set[str] = set()
+    unique_misses: list[tuple[str, float, str]] = []
+    unique_seen: dict[str, tuple[float, str]] = {}
     cache_miss_count = 0
-    for segment in all_segments:
+    for segment, complexity, segment_type in all_segments:
         cached = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
         if cached is not None:
-            if revalidate_cache_hits_quality_gate:
-                cached_quality = assess_translation_quality(segment, cached, source_lang, target_lang)
+            should_revalidate = revalidate_cache_hits_quality_gate or _should_revalidate_cache_hit(segment, complexity)
+            if should_revalidate:
+                cached_quality = assess_translation_quality(
+                    segment,
+                    cached,
+                    source_lang,
+                    target_lang,
+                    risk_tier=quality_tier_for_segment(complexity, segment_type),
+                )
                 if not cached_quality.ok:
                     _append_job_quality_record(
                         {
@@ -413,72 +836,121 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                         }
                     )
                     cache_miss_count += 1
-                    if segment not in unique_seen:
-                        unique_seen.add(segment)
-                        unique_misses.append(segment)
+                    prev = unique_seen.get(segment)
+                    if prev is None or complexity > prev[0]:
+                        unique_seen[segment] = (complexity, segment_type)
             continue
         cache_miss_count += 1
-        if segment not in unique_seen:
-            unique_seen.add(segment)
-            unique_misses.append(segment)
+        prev = unique_seen.get(segment)
+        if prev is None or complexity > prev[0]:
+            unique_seen[segment] = (complexity, segment_type)
+    unique_misses = [(segment, complexity, segment_type) for segment, (complexity, segment_type) in unique_seen.items()]
 
+    segment_meta_map = {segment: {"complexity": complexity, "segment_type": segment_type} for segment, complexity, segment_type in unique_misses}
     if unique_misses:
+        st.session_state.job_perf["quality_segments_total"] += len(unique_misses)
         target_chars = int(st.session_state.get("job_chunk_target_chars", 12000))
         batch_max_items = 24 if bool(settings.get("use_batch_api")) else 96
-        miss_chunks = _chunk_by_char_budget(unique_misses, target_chars=target_chars, max_items=batch_max_items)
+        miss_chunks = _chunk_by_complexity_budget(
+            [(segment, complexity) for segment, complexity, _ in unique_misses],
+            target_chars=target_chars,
+            max_items=batch_max_items,
+        )
 
         if bool(settings.get("use_batch_api")):
-            max_parallel = max(1, int(settings.get("max_parallel_requests", 1)))
-            soft_desired = max(1, len(unique_misses) // 12)
+            max_parallel = max(1, int(st.session_state.get("job_adaptive_parallel_current", settings.get("max_parallel_requests", 1))))
+            soft_desired = max(1, len(unique_misses) // 10)
             desired_chunks = min(max_parallel, soft_desired)
             miss_chunks = _rebalance_chunks_for_parallelism(miss_chunks, desired_chunks=desired_chunks)
 
         st.session_state.job_perf["chunks_sent"] += len(miss_chunks)
-        translate_chunks = getattr(provider, "translate_text_chunks", None)
-        if callable(translate_chunks):
-            translated_chunks = translate_chunks(miss_chunks, source_lang, target_lang)
-        else:
-            translated_chunks = [provider.translate_texts(chunk, source_lang, target_lang) for chunk in miss_chunks]
+        translated_chunks = _translate_chunks_with_policy(
+            provider,
+            miss_chunks,
+            source_lang,
+            target_lang,
+            strict_change=False,
+        )
 
-        retry_candidates: list[tuple[str, str, str]] = []
+        retry_candidates: list[tuple[str, str, str, float, str]] = []
         for miss_chunk, translated in zip(miss_chunks, translated_chunks):
             for orig, tr in zip(miss_chunk, translated):
                 fixed = glossary.get(tr, tr)
-                quality = assess_translation_quality(orig, fixed, source_lang, target_lang)
+                segment_meta = segment_meta_map.get(orig, {"complexity": 0.2, "segment_type": "plain"})
+                complexity = float(segment_meta.get("complexity", 0.2))
+                segment_type = str(segment_meta.get("segment_type", "plain"))
+                quality = assess_translation_quality(
+                    orig,
+                    fixed,
+                    source_lang,
+                    target_lang,
+                    risk_tier=quality_tier_for_segment(complexity, segment_type),
+                )
                 if quality.ok:
+                    if is_legit_unchanged(orig, fixed):
+                        st.session_state.job_perf["legit_unchanged_count"] += 1
                     cache.set(orig, fixed, source_lang, target_lang, provider.name, provider.model)
                     continue
 
                 st.session_state.job_perf["quality_retry_count"] += 1
-                retry_candidates.append((orig, quality.code, quality.message))
+                retry_candidates.append((orig, quality.code, quality.message, complexity, segment_type))
 
         if retry_candidates:
-            retry_texts = [orig for orig, _, _ in retry_candidates]
-            retry_max_items = 24 if bool(settings.get("use_batch_api")) else 64
-            retry_target_chars = max(4000, target_chars // 2)
-            retry_chunks = _chunk_by_char_budget(retry_texts, target_chars=retry_target_chars, max_items=retry_max_items)
+            def _retry_candidates_group(
+                candidates: list[tuple[str, str, str, float, str]],
+                *,
+                strict_change: bool,
+            ) -> dict[str, str]:
+                if not candidates:
+                    return {}
+                retry_texts = [(orig, complexity) for orig, _, _, complexity, _ in candidates]
+                retry_max_items = 24 if bool(settings.get("use_batch_api")) else 64
+                retry_target_chars = max(4000, target_chars // 2)
+                retry_chunks = _chunk_by_complexity_budget(
+                    retry_texts,
+                    target_chars=retry_target_chars,
+                    max_items=retry_max_items,
+                )
+                if bool(settings.get("use_batch_api")):
+                    max_parallel = max(1, int(settings.get("max_parallel_requests", 1)))
+                    soft_desired = max(1, len(retry_texts) // 12)
+                    desired_chunks = min(max_parallel, soft_desired)
+                    retry_chunks = _rebalance_chunks_for_parallelism(retry_chunks, desired_chunks=desired_chunks)
 
-            if bool(settings.get("use_batch_api")):
-                max_parallel = max(1, int(settings.get("max_parallel_requests", 1)))
-                soft_desired = max(1, len(retry_texts) // 12)
-                desired_chunks = min(max_parallel, soft_desired)
-                retry_chunks = _rebalance_chunks_for_parallelism(retry_chunks, desired_chunks=desired_chunks)
+                st.session_state.job_perf["chunks_sent"] += len(retry_chunks)
+                retry_translated_chunks = _translate_chunks_with_policy(
+                    provider,
+                    retry_chunks,
+                    source_lang,
+                    target_lang,
+                    strict_change=strict_change,
+                )
+                retry_results: dict[str, str] = {}
+                for retry_chunk, retry_translated in zip(retry_chunks, retry_translated_chunks):
+                    for orig, tr in zip(retry_chunk, retry_translated):
+                        retry_results[orig] = glossary.get(tr, tr)
+                return retry_results
 
-            st.session_state.job_perf["chunks_sent"] += len(retry_chunks)
-            if callable(translate_chunks):
-                retry_translated_chunks = translate_chunks(retry_chunks, source_lang, target_lang)
-            else:
-                retry_translated_chunks = [provider.translate_texts(chunk, source_lang, target_lang) for chunk in retry_chunks]
+            unchanged_candidates = [c for c in retry_candidates if c[1] == "unchanged_text"]
+            normal_candidates = [c for c in retry_candidates if c[1] != "unchanged_text"]
+            st.session_state.job_perf["unchanged_retry_attempts"] += len(unchanged_candidates)
 
             retry_results: dict[str, str] = {}
-            for retry_chunk, retry_translated in zip(retry_chunks, retry_translated_chunks):
-                for orig, tr in zip(retry_chunk, retry_translated):
-                    retry_results[orig] = glossary.get(tr, tr)
+            retry_results.update(_retry_candidates_group(normal_candidates, strict_change=False))
+            retry_results.update(_retry_candidates_group(unchanged_candidates, strict_change=True))
 
-            for orig, initial_issue, initial_message in retry_candidates:
+            for orig, initial_issue, initial_message, complexity, segment_type in retry_candidates:
                 retry_fixed = retry_results.get(orig, orig)
-                retry_quality = assess_translation_quality(orig, retry_fixed, source_lang, target_lang)
+                retry_quality = assess_translation_quality(
+                    orig,
+                    retry_fixed,
+                    source_lang,
+                    target_lang,
+                    risk_tier=quality_tier_for_segment(complexity, segment_type),
+                )
                 if retry_quality.ok:
+                    if is_legit_unchanged(orig, retry_fixed):
+                        st.session_state.job_perf["legit_unchanged_count"] += 1
                     cache.set(orig, retry_fixed, source_lang, target_lang, provider.name, provider.model)
                     _append_job_quality_record(
                         {
@@ -488,6 +960,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                             "message": initial_message,
                         }
                     )
+                    if initial_issue == "unchanged_text":
+                        st.session_state.job_perf["unchanged_retry_fixed"] += 1
                 else:
                     st.session_state.job_perf["quality_fail_count"] += 1
                     _append_job_quality_record(
@@ -498,6 +972,8 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                             "message": retry_quality.message,
                         }
                     )
+                    if initial_issue == "unchanged_text":
+                        st.session_state.job_perf["unchanged_retry_failed"] += 1
 
     _update_job_perf_metrics(
         provider=provider,
@@ -506,6 +982,9 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         unique_misses=len(unique_misses),
     )
     _autotune_chunk_target(provider)
+    _autotune_parallelism(provider)
+    _apply_safe_mode_guard()
+    _emit_run_telemetry("checkpoint")
 
     for record in task_records:
         row_idx = record["row_idx"]
@@ -517,9 +996,19 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                 cache.get(segment, source_lang, target_lang, provider.name, provider.model) or segment for segment in plan.segments
             ]
             translated_value = render_translation_plan(plan, translated_segments)
-            quality = assess_translation_quality(source, translated_value, source_lang, target_lang)
+            meta = getattr(plan, "segment_meta", None) or []
+            avg_complexity = (sum(float(m.get("complexity", 0.2)) for m in meta) / len(meta)) if meta else 0.2
+            segment_type = "html" if getattr(plan, "mode", "plain") == "html" else "plain"
+            quality = assess_translation_quality(
+                source,
+                translated_value,
+                source_lang,
+                target_lang,
+                risk_tier=quality_tier_for_segment(avg_complexity, segment_type),
+            )
             if not quality.ok:
                 st.session_state.job_error_count += 1
+                st.session_state.job_perf["cell_reject_count"] += 1
                 _append_job_report(make_record(row_idx, col, "quality_gate_failed", quality.message, source))
                 _append_job_quality_record(
                     {
@@ -558,31 +1047,47 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             st.session_state.job_df_out.at[row_idx, col] = source
 
     st.session_state.job_cursor = end_cursor
+    st.session_state.job_batch_index = int(st.session_state.get("job_batch_index", 0)) + 1
     cache.save()
     if st.session_state.job_cursor >= len(tasks):
         st.session_state.job_status = "completed"
-
-    st.session_state.job_translated_csv = dataframe_to_csv_bytes(st.session_state.job_df_out, fmt)
-    report_df = report_to_dataframe(st.session_state.job_report)
-    st.session_state.job_report_csv = report_df.to_csv(index=False).encode(fmt.encoding)
-    quality_df = _quality_report_to_dataframe(st.session_state.job_quality_report)
-    st.session_state.job_quality_csv = quality_df.to_csv(index=False).encode(fmt.encoding)
-    st.session_state.job_cache_json = json.dumps(cache._data, ensure_ascii=False, indent=2).encode("utf-8")
+    total_batches = (len(tasks) + per_run_cells - 1) // per_run_cells if per_run_cells > 0 else 0
+    should_write_artifacts = should_checkpoint(
+        batch_index=int(st.session_state.get("job_batch_index", 1)),
+        total_batches=total_batches,
+        checkpoint_every_batches=int(st.session_state.get("job_checkpoint_every_batches", 1)),
+        force=st.session_state.job_status == "completed",
+    )
+    if should_write_artifacts:
+        write_job_artifacts(
+            state=st.session_state,
+            fmt=fmt,
+            cache=cache,
+            source_df=source_df,
+            settings=settings,
+            quality_report_to_dataframe=_quality_report_to_dataframe,
+            build_run_summary=_build_run_summary,
+            build_validation_bundle_zip=_build_validation_bundle_zip,
+            include_validation_bundle=st.session_state.job_status == "completed",
+        )
     if st.session_state.job_status == "completed":
-        summary = _build_run_summary(source_df, settings)
-        st.session_state.job_validation_summary_json = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
-        st.session_state.job_validation_bundle_zip = _build_validation_bundle_zip()
+        _emit_run_telemetry("completed")
+        if not bool(st.session_state.get("job_run_gate_passed", False)):
+            st.session_state["job_publish_blocked_reason"] = ", ".join(
+                st.session_state.get("job_run_gate_reasons", [])
+            ) or "run_gate_failed"
 
 
 def _build_shoptet_client(prefix: str) -> ShoptetClient:
+    runtime = shoptet_from_session(st.session_state, prefix)
     return ShoptetClient(
         ShoptetConfig(
-            base_url=st.session_state[f"{prefix}_base_url"],
-            token=st.session_state[f"{prefix}_token"],
-            products_endpoint=st.session_state[f"{prefix}_products_endpoint"],
-            ean_field=st.session_state["api_ean_field"],
-            id_field=st.session_state["api_id_field"],
-            page_size=int(st.session_state["api_page_size"]),
+            base_url=runtime.base_url,
+            token=runtime.token,
+            products_endpoint=runtime.products_endpoint,
+            ean_field=runtime.ean_field,
+            id_field=runtime.id_field,
+            page_size=runtime.page_size,
         )
     )
 
@@ -667,7 +1172,7 @@ def main() -> None:
 
     st.subheader("Nastavení překladu")
     provider_name = st.selectbox("Provider", ["OpenAI"])
-    model = st.text_input("Model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    model = st.text_input("Model", value=RUNTIME_CONFIG.openai_model)
     source_lang = st.text_input("Source language", value="cs")
     target_lang = st.text_input("Target language", value="sk")
     max_chars = st.number_input("Max chars per request", min_value=100, max_value=8000, value=1200, step=100)
@@ -681,7 +1186,7 @@ def main() -> None:
     skip_codes = st.checkbox("SKU/EAN/kódy neměnit", value=True)
     skip_units = st.checkbox("Jednotky neměnit", value=True)
     keep_unsafe = st.checkbox("Keep translated anyway (unsafe)", value=False)
-    revalidate_cache_hits_quality_gate = st.checkbox("Revalidovat cache hity quality gate", value=False)
+    revalidate_cache_hits_quality_gate = st.checkbox("Revalidovat cache hity quality gate", value=True)
     glossary_json = st.text_area("Glossary JSON", value='{}')
 
     col_start, col_pause, col_resume, col_stop = st.columns(4)
@@ -751,6 +1256,12 @@ def main() -> None:
     if st.session_state.get("job_status") == "completed":
         _render_performance_panel()
         st.success("Překlad dokončen")
+        gate_passed = bool(st.session_state.get("job_run_gate_passed", False))
+        gate_reasons = st.session_state.get("job_run_gate_reasons", [])
+        if gate_passed:
+            st.success("Run gate: PASS")
+        else:
+            st.error("Run gate: FAIL" + (f" ({', '.join(gate_reasons)})" if gate_reasons else ""))
         st.download_button("Stáhnout translated.csv", data=BytesIO(st.session_state.job_translated_csv), file_name="translated.csv", mime="text/csv")
         st.download_button("Stáhnout translation_report.csv", data=BytesIO(st.session_state.job_report_csv), file_name="translation_report.csv", mime="text/csv")
         st.download_button("Stáhnout translation_cache.json", data=BytesIO(st.session_state.job_cache_json), file_name="translation_cache.json", mime="application/json")
@@ -760,8 +1271,16 @@ def main() -> None:
 
         if st.session_state.job_settings.get("source_mode") == "Shoptet API":
             st.subheader("Update SK produktů podle EAN")
+            if not gate_passed:
+                st.warning(
+                    "Publish blocked: run-level quality gate failed. "
+                    + (f"Důvody: {', '.join(gate_reasons)}" if gate_reasons else "")
+                )
             if st.button("Update SK verzi (PATCH podle EAN)"):
                 try:
+                    if not gate_passed:
+                        st.error("SK update zablokován run-level quality gate pravidly.")
+                        return
                     sk_client = _build_shoptet_client("sk")
                     sync_errors: list[dict[str, Any]] = []
                     updated, missing = sync_translated_to_sk(
@@ -770,8 +1289,16 @@ def main() -> None:
                         columns_to_sync=st.session_state.job_settings["translate_columns"],
                         ean_field=st.session_state["api_ean_field"],
                         report_errors=sync_errors,
+                        max_error_ratio=RUNTIME_CONFIG.sync_max_error_ratio,
                     )
+                    sk_metrics = sk_client.get_metrics_snapshot()
                     st.success(f"SK update hotov: updated={updated}, missing_ean={missing}")
+                    sync_error_ratio = float(sk_metrics.get("error_ratio", 0.0))
+                    if sync_error_ratio > float(RUNTIME_CONFIG.sync_max_error_ratio):
+                        st.error(
+                            f"SK sync error ratio too high ({sync_error_ratio:.2%}); "
+                            f"threshold {RUNTIME_CONFIG.sync_max_error_ratio:.2%}"
+                        )
                     if sync_errors:
                         st.dataframe(pd.DataFrame(sync_errors), width="stretch")
                 except Exception as exc:

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+
+translation_cache.json
+translation_cache.json.lock

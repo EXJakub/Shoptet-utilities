@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +34,42 @@ class ShoptetConfig:
     page_size: int = 100
 
 
+class ShoptetApiError(RuntimeError):
+    """Base error raised for Shoptet integration failures."""
+
+
+class ShoptetRetryableError(ShoptetApiError):
+    """Raised for transient failures that are likely recoverable."""
+
+
 class ShoptetClient:
-    def __init__(self, config: ShoptetConfig, timeout_s: int = 30) -> None:
+    def __init__(self, config: ShoptetConfig, timeout_s: int = 30, max_retries: int = 3, backoff_factor: float = 0.5) -> None:
         self.config = config
         self.timeout_s = timeout_s
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.session = self._build_session()
+        self._request_count = 0
+        self._error_count = 0
+        self._retryable_error_count = 0
+        self._total_latency_ms = 0
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=self.max_retries,
+            connect=self.max_retries,
+            read=self.max_retries,
+            status=self.max_retries,
+            backoff_factor=self.backoff_factor,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "PATCH"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
     def _url(self, endpoint: str) -> str:
         base_url = self._normalized_base_url()
@@ -76,8 +111,71 @@ class ShoptetClient:
         params: dict[str, Any] | None = None
         if include_pagination:
             params = {self.config.page_param: page, self.config.page_size_param: self.config.page_size}
-        resp = requests.get(self._url(self.config.products_endpoint), headers=self._headers(), params=params, timeout=self.timeout_s)
-        return resp
+            return self._request("GET", self.config.products_endpoint, params=params, allow_status_codes={400})
+        return self._request("GET", self.config.products_endpoint, params=params)
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        allow_status_codes: set[int] | None = None,
+    ) -> requests.Response:
+        started = time.perf_counter()
+        try:
+            response = self.session.request(
+                method,
+                self._url(endpoint),
+                headers=self._headers(),
+                params=params,
+                json=json_payload,
+                timeout=self.timeout_s,
+            )
+        except requests.Timeout as exc:
+            self._request_count += 1
+            self._error_count += 1
+            self._retryable_error_count += 1
+            self._total_latency_ms += int((time.perf_counter() - started) * 1000)
+            raise ShoptetRetryableError(f"Shoptet {method} timeout: {exc}") from exc
+        except requests.ConnectionError as exc:
+            self._request_count += 1
+            self._error_count += 1
+            self._retryable_error_count += 1
+            self._total_latency_ms += int((time.perf_counter() - started) * 1000)
+            raise ShoptetRetryableError(f"Shoptet {method} connection error: {exc}") from exc
+        except requests.RequestException as exc:
+            self._request_count += 1
+            self._error_count += 1
+            self._total_latency_ms += int((time.perf_counter() - started) * 1000)
+            raise ShoptetApiError(f"Shoptet {method} request failed: {exc}") from exc
+
+        self._request_count += 1
+        self._total_latency_ms += int((time.perf_counter() - started) * 1000)
+        allow_status_codes = allow_status_codes or set()
+        if response.status_code in allow_status_codes:
+            return response
+        if response.status_code in {429, 500, 502, 503, 504}:
+            self._error_count += 1
+            self._retryable_error_count += 1
+            raise ShoptetRetryableError(f"Shoptet {method} transient HTTP {response.status_code}")
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            self._error_count += 1
+            raise ShoptetApiError(f"Shoptet {method} failed with HTTP {response.status_code}") from exc
+        return response
+
+    def get_metrics_snapshot(self) -> dict[str, float]:
+        error_ratio = self._error_count / max(1, self._request_count)
+        avg_latency_ms = self._total_latency_ms / max(1, self._request_count)
+        return {
+            "request_count": float(self._request_count),
+            "error_count": float(self._error_count),
+            "retryable_error_count": float(self._retryable_error_count),
+            "error_ratio": float(error_ratio),
+            "avg_latency_ms": float(avg_latency_ms),
+        }
 
     def fetch_products(self, max_pages: int = 100) -> list[dict[str, Any]]:
         products: list[dict[str, Any]] = []
@@ -94,7 +192,6 @@ class ShoptetClient:
                 use_pagination = False
                 resp = self._fetch_products_page(page=page, include_pagination=False)
 
-            resp.raise_for_status()
             payload = resp.json()
             items = self._extract_items(payload)
             if not items:
@@ -115,8 +212,7 @@ class ShoptetClient:
 
     def update_product(self, product_id: str, payload: dict[str, Any]) -> None:
         endpoint = f"{self.config.products_endpoint.rstrip('/')}/{product_id}"
-        resp = requests.patch(self._url(endpoint), headers=self._headers(), json=payload, timeout=self.timeout_s)
-        resp.raise_for_status()
+        self._request("PATCH", endpoint, json_payload=payload)
 
 
 def sync_translated_to_sk(
@@ -125,6 +221,7 @@ def sync_translated_to_sk(
     columns_to_sync: list[str],
     ean_field: str,
     report_errors: list[dict[str, Any]],
+    max_error_ratio: float = 1.0,
 ) -> tuple[int, int]:
     sk_df = sk_client.fetch_products_df()
     if sk_df.empty:
@@ -135,16 +232,20 @@ def sync_translated_to_sk(
     if sk_client.config.id_field not in sk_df.columns:
         raise RuntimeError(f"ID field '{sk_client.config.id_field}' neexistuje ve SK datech.")
 
-    sk_index = {
-        str(row[ean_field]).strip(): str(row[sk_client.config.id_field]).strip()
-        for _, row in sk_df.iterrows()
-        if str(row.get(ean_field, "")).strip()
-    }
+    sk_index: dict[str, str] = {}
+    for row in sk_df.itertuples(index=False):
+        row_map = row._asdict()
+        ean_value = str(row_map.get(ean_field, "")).strip()
+        if not ean_value:
+            continue
+        sk_index[ean_value] = str(row_map.get(sk_client.config.id_field, "")).strip()
 
     updated = 0
     missing = 0
-    for idx, row in translated_df.iterrows():
-        ean = str(row.get(ean_field, "")).strip()
+    for row in translated_df.itertuples(index=True):
+        row_map = row._asdict()
+        idx = row_map.get("Index")
+        ean = str(row_map.get(ean_field, "")).strip()
         if not ean:
             continue
         product_id = sk_index.get(ean)
@@ -160,11 +261,13 @@ def sync_translated_to_sk(
             )
             continue
 
-        payload = {col: row.get(col, "") for col in columns_to_sync if col in translated_df.columns}
+        payload = {col: row_map.get(col, "") for col in columns_to_sync if col in translated_df.columns}
+        if not payload:
+            continue
         try:
             sk_client.update_product(product_id, payload)
             updated += 1
-        except Exception as exc:
+        except ShoptetApiError as exc:
             report_errors.append(
                 {
                     "row_index": _report_row_index(idx),
@@ -173,4 +276,15 @@ def sync_translated_to_sk(
                     "message": f"EAN {ean}: {exc}",
                 }
             )
+        metrics = sk_client.get_metrics_snapshot()
+        if float(metrics.get("error_ratio", 0.0)) > max_error_ratio:
+            report_errors.append(
+                {
+                    "row_index": _report_row_index(idx),
+                    "column": ean_field,
+                    "error_type": "sync_blocked_high_error_ratio",
+                    "message": f"Sync halted: error ratio {metrics['error_ratio']:.2%} exceeded {max_error_ratio:.2%}",
+                }
+            )
+            break
     return updated, missing
