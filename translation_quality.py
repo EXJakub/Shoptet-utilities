@@ -78,6 +78,12 @@ def is_legit_unchanged(source: str, translated: str) -> bool:
         # Short brand-like labels often legitimately stay unchanged in CZ/SK.
         if all(w.isupper() or w[:1].isupper() or any(ch.isdigit() for ch in w) for w in words):
             return True
+    if words and len(words) <= 2 and 3 <= alpha_len <= 12:
+        # CZ/SK share many short technical and catalog words (e.g. "adaptér", "black").
+        # Keep the rule conservative: no Czech-specific hints and no punctuation-heavy strings.
+        token_set = {w.lower() for w in words}
+        if not token_set.intersection(CZECH_HINTS) and plain.replace(" ", "").isalnum():
+            return True
     return False
 
 

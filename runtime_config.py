@@ -30,6 +30,7 @@ class RuntimeConfig:
     batch_parallel_upshift_p95_ms: int
     batch_chunk_downshift_avg_latency_ms: int
     batch_chunk_upshift_avg_latency_ms: int
+    max_unchanged_retries_per_batch: int
 
 
 @dataclass(slots=True)
@@ -68,6 +69,7 @@ def load_runtime_config() -> RuntimeConfig:
     parallel_upshift_p95_raw = os.getenv("BATCH_PARALLEL_UPSHIFT_P95_MS", "3500")
     chunk_downshift_latency_raw = os.getenv("BATCH_CHUNK_DOWNSHIFT_AVG_LATENCY_MS", "7000")
     chunk_upshift_latency_raw = os.getenv("BATCH_CHUNK_UPSHIFT_AVG_LATENCY_MS", "2800")
+    max_unchanged_retries_raw = os.getenv("BATCH_MAX_UNCHANGED_RETRIES_PER_BATCH", "40")
 
     try:
         min_parallel = max(1, int(min_parallel_raw))
@@ -142,6 +144,10 @@ def load_runtime_config() -> RuntimeConfig:
         chunk_upshift_avg_latency_ms = int(chunk_upshift_latency_raw)
     except ValueError:
         chunk_upshift_avg_latency_ms = 2800
+    try:
+        max_unchanged_retries_per_batch = int(max_unchanged_retries_raw)
+    except ValueError:
+        max_unchanged_retries_per_batch = 40
 
     quality_fail_ratio = min(max(quality_fail_ratio, 0.0), 1.0)
     provider_error_ratio = min(max(provider_error_ratio, 0.0), 1.0)
@@ -157,6 +163,7 @@ def load_runtime_config() -> RuntimeConfig:
     parallel_upshift_p95_ms = max(500, min(parallel_upshift_p95_ms, parallel_downshift_p95_ms))
     chunk_downshift_avg_latency_ms = max(1000, chunk_downshift_avg_latency_ms)
     chunk_upshift_avg_latency_ms = max(500, min(chunk_upshift_avg_latency_ms, chunk_downshift_avg_latency_ms))
+    max_unchanged_retries_per_batch = min(max(0, max_unchanged_retries_per_batch), 500)
 
     return RuntimeConfig(
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -182,6 +189,7 @@ def load_runtime_config() -> RuntimeConfig:
         batch_parallel_upshift_p95_ms=parallel_upshift_p95_ms,
         batch_chunk_downshift_avg_latency_ms=chunk_downshift_avg_latency_ms,
         batch_chunk_upshift_avg_latency_ms=chunk_upshift_avg_latency_ms,
+        max_unchanged_retries_per_batch=max_unchanged_retries_per_batch,
     )
 
 

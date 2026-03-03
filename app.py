@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import zipfile
 from io import BytesIO
 from typing import Any
@@ -314,6 +315,7 @@ def _build_quality_diagnostics(perf: dict[str, Any]) -> dict[str, Any]:
         "unchanged_retry_attempts": int(perf.get("unchanged_retry_attempts", 0)),
         "unchanged_retry_fixed": int(perf.get("unchanged_retry_fixed", 0)),
         "unchanged_retry_failed": int(perf.get("unchanged_retry_failed", 0)),
+        "unchanged_retry_skipped": int(perf.get("unchanged_retry_skipped", 0)),
         "legit_unchanged_count": int(perf.get("legit_unchanged_count", 0)),
     }
 
@@ -436,6 +438,7 @@ def _update_job_perf_metrics(
             "unchanged_retry_attempts": 0,
             "unchanged_retry_fixed": 0,
             "unchanged_retry_failed": 0,
+            "unchanged_retry_skipped": 0,
             "legit_unchanged_count": 0,
             "run_events": [],
         },
@@ -455,6 +458,7 @@ def _update_job_perf_metrics(
     perf.setdefault("unchanged_retry_attempts", 0)
     perf.setdefault("unchanged_retry_fixed", 0)
     perf.setdefault("unchanged_retry_failed", 0)
+    perf.setdefault("unchanged_retry_skipped", 0)
     perf.setdefault("legit_unchanged_count", 0)
     perf.setdefault("quality_action_counts", {})
     perf.setdefault("run_events", [])
@@ -637,6 +641,12 @@ def _render_performance_panel() -> None:
     cols5[0].metric("Cell reject ratio", f"{cell_reject_ratio*100:.1f}%")
     cols5[1].metric("Unchanged retry fixed", str(perf.get("unchanged_retry_fixed", 0)))
     cols5[2].metric("Legit unchanged", str(perf.get("legit_unchanged_count", 0)))
+    st.caption(
+        "Unchanged retries: "
+        f"attempted={int(perf.get('unchanged_retry_attempts', 0))}, "
+        f"skipped={int(perf.get('unchanged_retry_skipped', 0))}, "
+        f"failed={int(perf.get('unchanged_retry_failed', 0))}"
+    )
 
     events = perf.get("last_events", [])
     if events:
@@ -763,6 +773,7 @@ def _ensure_job(df: pd.DataFrame, settings: dict[str, Any], translate_columns: l
         "unchanged_retry_attempts": 0,
         "unchanged_retry_fixed": 0,
         "unchanged_retry_failed": 0,
+        "unchanged_retry_skipped": 0,
         "legit_unchanged_count": 0,
         "batch_invalid_shape_count": 0,
         "partial_recovery_count": 0,
@@ -812,21 +823,71 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     per_run_cells = int(settings["per_run_cells"])
     revalidate_cache_hits_quality_gate = bool(settings.get("revalidate_cache_hits_quality_gate", False))
     strict_change_for_unchanged_retry = bool(settings.get("strict_change_for_unchanged_retry", True))
+    max_unchanged_retries_per_batch = int(
+        settings.get("max_unchanged_retries_per_batch", RUNTIME_CONFIG.max_unchanged_retries_per_batch)
+    )
 
     cache = TranslationCache()
     tasks: list[tuple[int, str]] = st.session_state.job_tasks
-    end_cursor = min(st.session_state.job_cursor + per_run_cells, len(tasks))
+    start_cursor = int(st.session_state.get("job_cursor", 0))
+    target_end_cursor = min(start_cursor + per_run_cells, len(tasks))
+    # Prevent pathological long-running cycles on rows with huge segment fanout.
+    max_segments_per_batch = 1400
+    max_unique_misses_per_batch = 120
 
     task_records: list[dict[str, Any]] = []
     all_segments: list[tuple[str, float, str]] = []
-    for idx in range(st.session_state.job_cursor, end_cursor):
+    total_segments_budget = 0
+    unique_miss_candidates_seen: set[str] = set()
+    actual_end_cursor = start_cursor
+    for idx in range(start_cursor, target_end_cursor):
         row_idx, col = tasks[idx]
         source = str(source_df.at[row_idx, col] or "")
         plan = build_translation_plan(source, options, max_chars=max_chars)
+        planned_segments = len(plan.segments)
+        plan_mode = getattr(plan, "mode", "plain")
+        segment_meta = getattr(plan, "segment_meta", None) or [{"segment_type": plan_mode, "complexity": 0.2} for _ in plan.segments]
+        new_unique_misses = 0
+        for segment in plan.segments:
+            if segment in unique_miss_candidates_seen:
+                continue
+            cached_probe = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
+            if cached_probe is None:
+                new_unique_misses += 1
+        if task_records and (total_segments_budget + planned_segments) > max_segments_per_batch:
+            break
+        if task_records and (len(unique_miss_candidates_seen) + new_unique_misses) > max_unique_misses_per_batch:
+            break
         task_records.append({"row_idx": row_idx, "col": col, "source": source, "plan": plan})
+        total_segments_budget += planned_segments
+        actual_end_cursor = idx + 1
+        for segment, meta in zip(plan.segments, segment_meta):
+            if segment not in unique_miss_candidates_seen:
+                cached_probe = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
+                if cached_probe is None:
+                    unique_miss_candidates_seen.add(segment)
+            all_segments.append(
+                (
+                    segment,
+                    float(meta.get("complexity", 0.2)),
+                    str(meta.get("segment_type", plan_mode) or plan_mode),
+                )
+            )
+    if not task_records and start_cursor < len(tasks):
+        # Ensure forward progress even for a single oversized row.
+        row_idx, col = tasks[start_cursor]
+        source = str(source_df.at[row_idx, col] or "")
+        plan = build_translation_plan(source, options, max_chars=max_chars)
+        task_records.append({"row_idx": row_idx, "col": col, "source": source, "plan": plan})
+        total_segments_budget = len(plan.segments)
+        actual_end_cursor = start_cursor + 1
         plan_mode = getattr(plan, "mode", "plain")
         segment_meta = getattr(plan, "segment_meta", None) or [{"segment_type": plan_mode, "complexity": 0.2} for _ in plan.segments]
         for segment, meta in zip(plan.segments, segment_meta):
+            if segment not in unique_miss_candidates_seen:
+                cached_probe = cache.get(segment, source_lang, target_lang, provider.name, provider.model)
+                if cached_probe is None:
+                    unique_miss_candidates_seen.add(segment)
             all_segments.append(
                 (
                     segment,
@@ -869,7 +930,6 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         if prev is None or complexity > prev[0]:
             unique_seen[segment] = (complexity, segment_type)
     unique_misses = [(segment, complexity, segment_type) for segment, (complexity, segment_type) in unique_seen.items()]
-
     segment_meta_map = {segment: {"complexity": complexity, "segment_type": segment_type} for segment, complexity, segment_type in unique_misses}
     if unique_misses:
         st.session_state.job_perf["quality_segments_total"] += len(unique_misses)
@@ -888,6 +948,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             miss_chunks = _rebalance_chunks_for_parallelism(miss_chunks, desired_chunks=desired_chunks)
 
         st.session_state.job_perf["chunks_sent"] += len(miss_chunks)
+        primary_started = time.perf_counter()
         translated_chunks = _translate_chunks_with_policy(
             provider,
             miss_chunks,
@@ -895,6 +956,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             target_lang,
             strict_change=False,
         )
+        _ = int((time.perf_counter() - primary_started) * 1000)
 
         retry_candidates: list[tuple[str, str, str, float, str]] = []
         for miss_chunk, translated in zip(miss_chunks, translated_chunks):
@@ -940,7 +1002,6 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
                     soft_desired = max(1, len(retry_texts) // 12)
                     desired_chunks = min(max_parallel, soft_desired)
                     retry_chunks = _rebalance_chunks_for_parallelism(retry_chunks, desired_chunks=desired_chunks)
-
                 st.session_state.job_perf["chunks_sent"] += len(retry_chunks)
                 retry_translated_chunks = _translate_chunks_with_policy(
                     provider,
@@ -957,18 +1018,35 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
             unchanged_candidates = [c for c in retry_candidates if c[1] == "unchanged_text"]
             normal_candidates = [c for c in retry_candidates if c[1] != "unchanged_text"]
-            st.session_state.job_perf["unchanged_retry_attempts"] += len(unchanged_candidates)
+            allowed_unchanged_retries = max(0, max_unchanged_retries_per_batch)
+            selected_unchanged_candidates = unchanged_candidates[:allowed_unchanged_retries]
+            skipped_unchanged_candidates = unchanged_candidates[allowed_unchanged_retries:]
+            skipped_unchanged_set = {orig for orig, _, _, _, _ in skipped_unchanged_candidates}
+            st.session_state.job_perf["unchanged_retry_attempts"] += len(selected_unchanged_candidates)
+            st.session_state.job_perf["unchanged_retry_skipped"] += len(skipped_unchanged_candidates)
 
             retry_results: dict[str, str] = {}
             retry_results.update(_retry_candidates_group(normal_candidates, strict_change=False))
             retry_results.update(
                 _retry_candidates_group(
-                    unchanged_candidates,
+                    selected_unchanged_candidates,
                     strict_change=strict_change_for_unchanged_retry,
                 )
             )
 
             for orig, initial_issue, initial_message, complexity, segment_type in retry_candidates:
+                if orig in skipped_unchanged_set:
+                    st.session_state.job_perf["quality_fail_count"] += 1
+                    st.session_state.job_perf["unchanged_retry_failed"] += 1
+                    _append_job_quality_record(
+                        {
+                            "source_hash": hashlib.sha256(orig.encode("utf-8")).hexdigest()[:16],
+                            "issue": initial_issue,
+                            "action": "retry_skipped_budget",
+                            "message": initial_message,
+                        }
+                    )
+                    continue
                 retry_fixed = retry_results.get(orig, orig)
                 retry_quality = assess_translation_quality(
                     orig,
@@ -1075,9 +1153,11 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             _append_job_report(make_record(row_idx, col, "api_error", str(exc), source))
             st.session_state.job_df_out.at[row_idx, col] = source
 
-    st.session_state.job_cursor = end_cursor
+    st.session_state.job_cursor = actual_end_cursor
     st.session_state.job_batch_index = int(st.session_state.get("job_batch_index", 0)) + 1
+    save_started = time.perf_counter()
     cache.save()
+    save_ms = int((time.perf_counter() - save_started) * 1000)
     if st.session_state.job_cursor >= len(tasks):
         st.session_state.job_status = "completed"
     total_batches = (len(tasks) + per_run_cells - 1) // per_run_cells if per_run_cells > 0 else 0
@@ -1088,6 +1168,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
         force=st.session_state.job_status == "completed",
     )
     if should_write_artifacts:
+        artifacts_started = time.perf_counter()
         write_job_artifacts(
             state=st.session_state,
             fmt=fmt,
@@ -1099,6 +1180,9 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
             build_validation_bundle_zip=_build_validation_bundle_zip,
             include_validation_bundle=st.session_state.job_status == "completed",
         )
+        artifacts_ms = int((time.perf_counter() - artifacts_started) * 1000)
+    else:
+        artifacts_ms = 0
     if st.session_state.job_status == "completed":
         _emit_run_telemetry("completed")
         if not bool(st.session_state.get("job_run_gate_passed", False)):
@@ -1221,6 +1305,14 @@ def main() -> None:
         value=True,
         help="Když je vypnuto, retry pro unchanged_text používá stejný prompt jako běžný překlad.",
     )
+    max_unchanged_retries_per_batch = st.number_input(
+        "Max unchanged retry segmentů na batch",
+        min_value=0,
+        max_value=500,
+        value=int(RUNTIME_CONFIG.max_unchanged_retries_per_batch),
+        step=5,
+        help="Omezuje počet segmentů s issue unchanged_text, které jdou do retry v jednom batchi.",
+    )
     glossary_json = st.text_area("Glossary JSON", value='{}')
 
     col_start, col_pause, col_resume, col_stop = st.columns(4)
@@ -1266,6 +1358,7 @@ def main() -> None:
             "keep_unsafe": keep_unsafe,
             "revalidate_cache_hits_quality_gate": revalidate_cache_hits_quality_gate,
             "strict_change_for_unchanged_retry": strict_change_for_unchanged_retry,
+            "max_unchanged_retries_per_batch": int(max_unchanged_retries_per_batch),
             "glossary": glossary,
             "per_run_cells": int(per_run_cells),
             "translation_options": {
