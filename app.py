@@ -140,6 +140,29 @@ def _build_validation_bundle_zip() -> bytes:
         archive.writestr("validation_summary.json", st.session_state.get("job_validation_summary_json", b""))
     return buffer.getvalue()
 
+
+def _finalize_stopped_job(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
+    settings: dict[str, Any] = st.session_state.get("job_settings", {})
+    if not settings or "job_df_out" not in st.session_state:
+        return
+    cache = TranslationCache()
+    write_job_artifacts(
+        state=st.session_state,
+        fmt=fmt,
+        cache=cache,
+        source_df=source_df,
+        settings=settings,
+        quality_report_to_dataframe=_quality_report_to_dataframe,
+        build_run_summary=_build_run_summary,
+        build_validation_bundle_zip=_build_validation_bundle_zip,
+        include_validation_bundle=True,
+    )
+    _emit_run_telemetry("stopped")
+    if not bool(st.session_state.get("job_run_gate_passed", False)):
+        st.session_state["job_publish_blocked_reason"] = ", ".join(
+            st.session_state.get("job_run_gate_reasons", [])
+        ) or "run_gate_failed"
+
 def _provider_signature(settings: dict[str, Any]) -> tuple[Any, ...]:
     return (
         settings["provider_name"],
@@ -1202,6 +1225,10 @@ def main() -> None:
         st.rerun()
     if stop_clicked and st.session_state.get("job_active"):
         st.session_state.job_status = "stopped"
+        try:
+            _finalize_stopped_job(input_df, fmt)
+        except Exception as exc:  # pragma: no cover - defensive UI safeguard
+            st.error(f"Stop finalize selhal: {exc}")
         st.session_state.job_active = False
 
     if start_clicked:
@@ -1253,9 +1280,12 @@ def main() -> None:
             if st.session_state.job_status != "completed":
                 st.rerun()
 
-    if st.session_state.get("job_status") == "completed":
+    if st.session_state.get("job_status") in {"completed", "stopped"}:
         _render_performance_panel()
-        st.success("Překlad dokončen")
+        if st.session_state.get("job_status") == "completed":
+            st.success("Překlad dokončen")
+        else:
+            st.warning("Běh byl zastaven. Exporty byly vygenerovány z aktuálního stavu.")
         gate_passed = bool(st.session_state.get("job_run_gate_passed", False))
         gate_reasons = st.session_state.get("job_run_gate_reasons", [])
         if gate_passed:
