@@ -50,8 +50,15 @@ def _alpha_len(text: str) -> int:
     return sum(1 for ch in text if LETTER_RE.match(ch))
 
 
-def quality_tier_for_complexity(complexity: float) -> str:
+def quality_tier_for_segment(complexity: float, segment_type: str = "plain") -> str:
+    # HTML and very complex segments are riskier; keep stricter guardrails there.
+    if segment_type == "html" and complexity >= 0.45:
+        return "strict"
     return "strict" if complexity >= 0.6 else "fast"
+
+
+def quality_tier_for_complexity(complexity: float) -> str:
+    return quality_tier_for_segment(complexity, segment_type="plain")
 
 
 def assess_translation_quality(

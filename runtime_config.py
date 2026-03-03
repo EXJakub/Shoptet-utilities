@@ -18,10 +18,18 @@ class RuntimeConfig:
     quality_gate_max_provider_error_ratio: float
     quality_gate_max_batch_shape_error_rate: float
     quality_gate_max_p95_latency_ms: int
+    quality_gate_min_quality_samples: int
+    quality_gate_min_latency_samples: int
+    quality_gate_min_batch_shape_samples: int
     cache_revalidation_low_risk_sample_rate: float
     telemetry_backend: str
     telemetry_jsonl_path: str
     sync_max_error_ratio: float
+    batch_autotune_cooldown_batches: int
+    batch_parallel_downshift_p95_ms: int
+    batch_parallel_upshift_p95_ms: int
+    batch_chunk_downshift_avg_latency_ms: int
+    batch_chunk_upshift_avg_latency_ms: int
 
 
 @dataclass(slots=True)
@@ -48,10 +56,18 @@ def load_runtime_config() -> RuntimeConfig:
     provider_error_ratio_raw = os.getenv("QUALITY_GATE_MAX_PROVIDER_ERROR_RATIO", "0.02")
     batch_shape_rate_raw = os.getenv("QUALITY_GATE_MAX_BATCH_SHAPE_ERROR_RATE", "0.15")
     p95_latency_raw = os.getenv("QUALITY_GATE_MAX_P95_LATENCY_MS", "12000")
+    quality_min_samples_raw = os.getenv("QUALITY_GATE_MIN_QUALITY_SAMPLES", "25")
+    latency_min_samples_raw = os.getenv("QUALITY_GATE_MIN_LATENCY_SAMPLES", "8")
+    batch_shape_min_samples_raw = os.getenv("QUALITY_GATE_MIN_BATCH_SHAPE_SAMPLES", "10")
     cache_sample_raw = os.getenv("CACHE_REVALIDATION_LOW_RISK_SAMPLE_RATE", "0.10")
     telemetry_backend = os.getenv("TELEMETRY_BACKEND", "noop").strip().lower() or "noop"
     telemetry_jsonl_path = os.getenv("TELEMETRY_JSONL_PATH", "telemetry/runs.jsonl")
     sync_max_error_ratio_raw = os.getenv("SYNC_MAX_ERROR_RATIO", "0.20")
+    autotune_cooldown_raw = os.getenv("BATCH_AUTOTUNE_COOLDOWN_BATCHES", "2")
+    parallel_downshift_p95_raw = os.getenv("BATCH_PARALLEL_DOWNSHIFT_P95_MS", "8500")
+    parallel_upshift_p95_raw = os.getenv("BATCH_PARALLEL_UPSHIFT_P95_MS", "3500")
+    chunk_downshift_latency_raw = os.getenv("BATCH_CHUNK_DOWNSHIFT_AVG_LATENCY_MS", "7000")
+    chunk_upshift_latency_raw = os.getenv("BATCH_CHUNK_UPSHIFT_AVG_LATENCY_MS", "2800")
 
     try:
         min_parallel = max(1, int(min_parallel_raw))
@@ -87,6 +103,18 @@ def load_runtime_config() -> RuntimeConfig:
     except ValueError:
         p95_latency_ms = 12000
     try:
+        quality_min_samples = int(quality_min_samples_raw)
+    except ValueError:
+        quality_min_samples = 25
+    try:
+        latency_min_samples = int(latency_min_samples_raw)
+    except ValueError:
+        latency_min_samples = 8
+    try:
+        batch_shape_min_samples = int(batch_shape_min_samples_raw)
+    except ValueError:
+        batch_shape_min_samples = 10
+    try:
         cache_sample_rate = float(cache_sample_raw)
     except ValueError:
         cache_sample_rate = 0.10
@@ -94,13 +122,41 @@ def load_runtime_config() -> RuntimeConfig:
         sync_max_error_ratio = float(sync_max_error_ratio_raw)
     except ValueError:
         sync_max_error_ratio = 0.20
+    try:
+        autotune_cooldown_batches = int(autotune_cooldown_raw)
+    except ValueError:
+        autotune_cooldown_batches = 2
+    try:
+        parallel_downshift_p95_ms = int(parallel_downshift_p95_raw)
+    except ValueError:
+        parallel_downshift_p95_ms = 8500
+    try:
+        parallel_upshift_p95_ms = int(parallel_upshift_p95_raw)
+    except ValueError:
+        parallel_upshift_p95_ms = 3500
+    try:
+        chunk_downshift_avg_latency_ms = int(chunk_downshift_latency_raw)
+    except ValueError:
+        chunk_downshift_avg_latency_ms = 7000
+    try:
+        chunk_upshift_avg_latency_ms = int(chunk_upshift_latency_raw)
+    except ValueError:
+        chunk_upshift_avg_latency_ms = 2800
 
     quality_fail_ratio = min(max(quality_fail_ratio, 0.0), 1.0)
     provider_error_ratio = min(max(provider_error_ratio, 0.0), 1.0)
     batch_shape_error_rate = min(max(batch_shape_error_rate, 0.0), 1.0)
+    quality_min_samples = max(1, quality_min_samples)
+    latency_min_samples = max(1, latency_min_samples)
+    batch_shape_min_samples = max(1, batch_shape_min_samples)
     cache_sample_rate = min(max(cache_sample_rate, 0.0), 1.0)
     sync_max_error_ratio = min(max(sync_max_error_ratio, 0.01), 1.0)
     p95_latency_ms = max(1000, p95_latency_ms)
+    autotune_cooldown_batches = max(0, autotune_cooldown_batches)
+    parallel_downshift_p95_ms = max(1000, parallel_downshift_p95_ms)
+    parallel_upshift_p95_ms = max(500, min(parallel_upshift_p95_ms, parallel_downshift_p95_ms))
+    chunk_downshift_avg_latency_ms = max(1000, chunk_downshift_avg_latency_ms)
+    chunk_upshift_avg_latency_ms = max(500, min(chunk_upshift_avg_latency_ms, chunk_downshift_avg_latency_ms))
 
     return RuntimeConfig(
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -114,10 +170,18 @@ def load_runtime_config() -> RuntimeConfig:
         quality_gate_max_provider_error_ratio=provider_error_ratio,
         quality_gate_max_batch_shape_error_rate=batch_shape_error_rate,
         quality_gate_max_p95_latency_ms=p95_latency_ms,
+        quality_gate_min_quality_samples=quality_min_samples,
+        quality_gate_min_latency_samples=latency_min_samples,
+        quality_gate_min_batch_shape_samples=batch_shape_min_samples,
         cache_revalidation_low_risk_sample_rate=cache_sample_rate,
         telemetry_backend=telemetry_backend if telemetry_backend in {"noop", "jsonl"} else "noop",
         telemetry_jsonl_path=telemetry_jsonl_path,
         sync_max_error_ratio=sync_max_error_ratio,
+        batch_autotune_cooldown_batches=autotune_cooldown_batches,
+        batch_parallel_downshift_p95_ms=parallel_downshift_p95_ms,
+        batch_parallel_upshift_p95_ms=parallel_upshift_p95_ms,
+        batch_chunk_downshift_avg_latency_ms=chunk_downshift_avg_latency_ms,
+        batch_chunk_upshift_avg_latency_ms=chunk_upshift_avg_latency_ms,
     )
 
 

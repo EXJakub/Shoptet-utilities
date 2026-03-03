@@ -46,9 +46,30 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sample_size(metrics: dict[str, float], name: str) -> int:
+    if name == "quality_fail_ratio":
+        return int(metrics.get("quality_sample_size", 0))
+    if name == "p95_latency_ms":
+        return int(metrics.get("latency_sample_size", 0))
+    if name == "batch_shape_error_rate":
+        return int(metrics.get("batch_shape_sample_size", 0))
+    if name == "provider_error_ratio":
+        return int(metrics.get("provider_error_sample_size", 0))
+    return 0
+
+
+def _min_required_samples(thresholds: dict[str, float], name: str) -> int:
+    key = f"{name}_min_samples"
+    return int(thresholds.get(key, 1))
+
+
+def _passes_sample_gate(metrics: dict[str, float], thresholds: dict[str, float], name: str) -> bool:
+    return _sample_size(metrics, name) >= _min_required_samples(thresholds, name)
+
+
 def evaluate_alerts(metrics: dict[str, float], thresholds: dict[str, float]) -> list[AlertRule]:
     alerts: list[AlertRule] = []
-    if metrics.get("quality_fail_ratio", 0.0) > thresholds["quality_fail_ratio"]:
+    if _passes_sample_gate(metrics, thresholds, "quality_fail_ratio") and metrics.get("quality_fail_ratio", 0.0) > thresholds["quality_fail_ratio"]:
         alerts.append(
             AlertRule(
                 name="quality_fail_ratio",
@@ -58,7 +79,7 @@ def evaluate_alerts(metrics: dict[str, float], thresholds: dict[str, float]) -> 
                 message="Quality fail ratio exceeded threshold.",
             )
         )
-    if metrics.get("provider_error_ratio", 0.0) > thresholds["provider_error_ratio"]:
+    if _passes_sample_gate(metrics, thresholds, "provider_error_ratio") and metrics.get("provider_error_ratio", 0.0) > thresholds["provider_error_ratio"]:
         alerts.append(
             AlertRule(
                 name="provider_error_ratio",
@@ -68,7 +89,7 @@ def evaluate_alerts(metrics: dict[str, float], thresholds: dict[str, float]) -> 
                 message="Provider error ratio exceeded threshold.",
             )
         )
-    if metrics.get("batch_shape_error_rate", 0.0) > thresholds["batch_shape_error_rate"]:
+    if _passes_sample_gate(metrics, thresholds, "batch_shape_error_rate") and metrics.get("batch_shape_error_rate", 0.0) > thresholds["batch_shape_error_rate"]:
         alerts.append(
             AlertRule(
                 name="batch_shape_error_rate",
@@ -78,7 +99,7 @@ def evaluate_alerts(metrics: dict[str, float], thresholds: dict[str, float]) -> 
                 message="Batch shape error rate exceeded threshold.",
             )
         )
-    if metrics.get("p95_latency_ms", 0.0) > thresholds["p95_latency_ms"]:
+    if _passes_sample_gate(metrics, thresholds, "p95_latency_ms") and metrics.get("p95_latency_ms", 0.0) > thresholds["p95_latency_ms"]:
         alerts.append(
             AlertRule(
                 name="p95_latency_ms",
@@ -93,13 +114,13 @@ def evaluate_alerts(metrics: dict[str, float], thresholds: dict[str, float]) -> 
 
 def evaluate_run_gate(metrics: dict[str, float], thresholds: dict[str, float]) -> tuple[bool, list[str]]:
     reasons: list[str] = []
-    if metrics.get("quality_fail_ratio", 0.0) > thresholds["quality_fail_ratio"]:
+    if _passes_sample_gate(metrics, thresholds, "quality_fail_ratio") and metrics.get("quality_fail_ratio", 0.0) > thresholds["quality_fail_ratio"]:
         reasons.append("quality_fail_ratio")
-    if metrics.get("provider_error_ratio", 0.0) > thresholds["provider_error_ratio"]:
+    if _passes_sample_gate(metrics, thresholds, "provider_error_ratio") and metrics.get("provider_error_ratio", 0.0) > thresholds["provider_error_ratio"]:
         reasons.append("provider_error_ratio")
-    if metrics.get("batch_shape_error_rate", 0.0) > thresholds["batch_shape_error_rate"]:
+    if _passes_sample_gate(metrics, thresholds, "batch_shape_error_rate") and metrics.get("batch_shape_error_rate", 0.0) > thresholds["batch_shape_error_rate"]:
         reasons.append("batch_shape_error_rate")
-    if metrics.get("p95_latency_ms", 0.0) > thresholds["p95_latency_ms"]:
+    if _passes_sample_gate(metrics, thresholds, "p95_latency_ms") and metrics.get("p95_latency_ms", 0.0) > thresholds["p95_latency_ms"]:
         reasons.append("p95_latency_ms")
     return (len(reasons) == 0, reasons)
 
@@ -113,8 +134,9 @@ def build_run_envelope(
     alerts: list[AlertRule],
     gate_passed: bool,
     gate_reasons: list[str],
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "timestamp": utc_now_iso(),
         "run_id": run_id,
         "phase": phase,
@@ -123,3 +145,6 @@ def build_run_envelope(
         "alerts": [asdict(a) for a in alerts],
         "run_gate": {"passed": gate_passed, "reasons": gate_reasons},
     }
+    if diagnostics:
+        payload["diagnostics"] = diagnostics
+    return payload

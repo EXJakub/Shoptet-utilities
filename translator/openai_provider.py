@@ -288,6 +288,8 @@ class OpenAIProvider(TranslationProvider):
         total_count = sum(len(chunk) for chunk in text_chunks)
         total_chars = sum(len(item) for chunk in text_chunks for item in chunk)
         self._translate_calls_total += len(text_chunks)
+        baseline_recoveries = self._partial_recovery_count
+        baseline_isolations = self._isolated_item_fallback_count
         started = time.perf_counter()
         try:
             translated_chunks = asyncio.run(self._translate_batch_chunks_async(text_chunks, source_lang, target_lang))
@@ -298,7 +300,10 @@ class OpenAIProvider(TranslationProvider):
                     input_chars=total_chars,
                     latency_ms=int((time.perf_counter() - started) * 1000),
                     success=True,
-                    fallback_used=self._partial_recovery_count > 0 or self._isolated_item_fallback_count > 0,
+                    fallback_used=(
+                        self._partial_recovery_count > baseline_recoveries
+                        or self._isolated_item_fallback_count > baseline_isolations
+                    ),
                 )
             )
             return translated_chunks
@@ -344,6 +349,8 @@ class OpenAIProvider(TranslationProvider):
         input_chars = sum(len(t) for t in texts)
 
         if self.use_batch_api:
+            baseline_recoveries = self._partial_recovery_count
+            baseline_isolations = self._isolated_item_fallback_count
             started = time.perf_counter()
             try:
                 translated = self._batch(texts, source_lang, target_lang)
@@ -354,7 +361,10 @@ class OpenAIProvider(TranslationProvider):
                         input_chars=input_chars,
                         latency_ms=int((time.perf_counter() - started) * 1000),
                         success=True,
-                        fallback_used=self._partial_recovery_count > 0 or self._isolated_item_fallback_count > 0,
+                        fallback_used=(
+                            self._partial_recovery_count > baseline_recoveries
+                            or self._isolated_item_fallback_count > baseline_isolations
+                        ),
                     )
                 )
                 return translated

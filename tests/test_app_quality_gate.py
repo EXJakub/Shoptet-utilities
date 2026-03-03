@@ -232,3 +232,36 @@ def test_safe_mode_guard_reduces_parallel_and_chunk_when_fallback_rate_high(monk
 
     assert fake_st.session_state["job_adaptive_parallel_current"] <= 8
     assert fake_st.session_state["job_chunk_target_chars"] < 12000
+
+
+def test_autotune_parallelism_respects_cooldown(monkeypatch) -> None:
+    fake_st = _FakeSt()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.RUNTIME_CONFIG.batch_min_parallel = 2
+    app.RUNTIME_CONFIG.batch_max_parallel = 64
+    app.RUNTIME_CONFIG.batch_autotune_cooldown_batches = 3
+    app.RUNTIME_CONFIG.batch_parallel_downshift_p95_ms = 8500
+    app.RUNTIME_CONFIG.batch_parallel_upshift_p95_ms = 3000
+
+    events = [{"latency_ms": 12000, "success": True, "fallback_used": False} for _ in range(8)]
+
+    class _Provider:
+        def get_metrics_snapshot(self):
+            return {"events": events}
+
+    fake_st.session_state.update(
+        {
+            "job_settings": {"max_parallel_requests": 16},
+            "job_adaptive_parallel_current": 16,
+            "job_batch_index": 10,
+            "job_perf": {"autotune_last_parallel_batch": 9},
+        }
+    )
+
+    app._autotune_parallelism(_Provider())
+    # Cooldown active: no change.
+    assert fake_st.session_state["job_adaptive_parallel_current"] == 16
+
+    fake_st.session_state["job_batch_index"] = 20
+    app._autotune_parallelism(_Provider())
+    assert fake_st.session_state["job_adaptive_parallel_current"] == 8

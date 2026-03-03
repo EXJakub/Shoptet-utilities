@@ -35,6 +35,9 @@ def test_stuck_zone_guardrails_maintain_progress_signal(monkeypatch) -> None:
     app.RUNTIME_CONFIG.batch_min_parallel = 4
     app.RUNTIME_CONFIG.batch_max_parallel = 64
     app.RUNTIME_CONFIG.batch_safe_mode_fallback_threshold = 0.25
+    app.RUNTIME_CONFIG.batch_autotune_cooldown_batches = 0
+    app.RUNTIME_CONFIG.batch_parallel_downshift_p95_ms = 8500
+    app.RUNTIME_CONFIG.batch_parallel_upshift_p95_ms = 3000
 
     provider = _FakeProvider()
     app._update_job_perf_metrics(provider, total_segments=1000, cache_misses=100, unique_misses=80)
@@ -45,3 +48,27 @@ def test_stuck_zone_guardrails_maintain_progress_signal(monkeypatch) -> None:
 
     assert app.st.session_state["job_perf"]["effective_tpm_estimate"] > 0
     assert app.st.session_state["job_adaptive_parallel_current"] <= 16
+
+
+def test_run_metrics_use_quality_sample_denominator_and_split_latency() -> None:
+    app.st.session_state = {
+        "job_translated_count": 10,
+        "job_started_at": app.pd.Timestamp.utcnow() - app.pd.Timedelta(minutes=1),
+        "job_perf": {
+            "quality_fail_count": 4,
+            "quality_segments_total": 40,
+            "error_count": 1,
+            "batch_shape_error_rate": 0.1,
+            "effective_tpm_estimate": 1200,
+            "cache_misses_total": 20,
+            "segments_total": 100,
+            "chunks_sent": 25,
+            "last_events": [{"latency_ms": 1000}, {"latency_ms": 2000}, {"latency_ms": 9000}],
+            "run_events": [{"latency_ms": 1000}, {"latency_ms": 2000}, {"latency_ms": 9000}, {"latency_ms": 18000}],
+        },
+    }
+    metrics = app._calc_run_metrics()
+    assert metrics["quality_fail_ratio"] == 0.1
+    assert metrics["recent_p95_latency_ms"] == 2000.0
+    assert metrics["run_p95_latency_ms"] == 9000.0
+    assert metrics["p95_latency_ms"] == metrics["run_p95_latency_ms"]

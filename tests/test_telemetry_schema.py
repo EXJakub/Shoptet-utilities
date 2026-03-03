@@ -22,3 +22,17 @@ def test_telemetry_envelope_contains_required_fields() -> None:
     assert envelope["alerts"][0]["name"] == "x"
     assert envelope["run_gate"]["passed"] is False
     assert envelope["run_gate"]["reasons"] == ["quality_fail_ratio"]
+
+
+def test_telemetry_envelope_includes_diagnostics_when_provided() -> None:
+    envelope = build_run_envelope(
+        run_id="run-2",
+        phase="completed",
+        status="completed",
+        metrics={"quality_fail_ratio": 0.01},
+        alerts=[],
+        gate_passed=True,
+        gate_reasons=[],
+        diagnostics={"quality_issue_counts": {"unchanged_text": 2}},
+    )
+    assert envelope["diagnostics"]["quality_issue_counts"]["unchanged_text"] == 2
