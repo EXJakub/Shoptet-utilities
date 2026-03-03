@@ -1285,7 +1285,14 @@ def main() -> None:
         if st.session_state.get("job_status") == "completed":
             st.success("Překlad dokončen")
         else:
-            st.warning("Běh byl zastaven. Exporty byly vygenerovány z aktuálního stavu.")
+            done = int(st.session_state.get("job_cursor", 0))
+            total = len(st.session_state.get("job_tasks", []))
+            translated = int(st.session_state.get("job_translated_count", 0))
+            errors = int(st.session_state.get("job_error_count", 0))
+            st.warning(
+                "Běh byl zastaven. Exporty byly vygenerovány z aktuálního stavu. "
+                f"Hotovo: {done}/{total} | Přeloženo: {translated} | Chyb: {errors}"
+            )
         gate_passed = bool(st.session_state.get("job_run_gate_passed", False))
         gate_reasons = st.session_state.get("job_run_gate_reasons", [])
         if gate_passed:
