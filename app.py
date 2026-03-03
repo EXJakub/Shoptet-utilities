@@ -811,6 +811,7 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
     max_chars = int(settings["max_chars"])
     per_run_cells = int(settings["per_run_cells"])
     revalidate_cache_hits_quality_gate = bool(settings.get("revalidate_cache_hits_quality_gate", False))
+    strict_change_for_unchanged_retry = bool(settings.get("strict_change_for_unchanged_retry", True))
 
     cache = TranslationCache()
     tasks: list[tuple[int, str]] = st.session_state.job_tasks
@@ -960,7 +961,12 @@ def _process_batch(source_df: pd.DataFrame, fmt: CsvFormat) -> None:
 
             retry_results: dict[str, str] = {}
             retry_results.update(_retry_candidates_group(normal_candidates, strict_change=False))
-            retry_results.update(_retry_candidates_group(unchanged_candidates, strict_change=True))
+            retry_results.update(
+                _retry_candidates_group(
+                    unchanged_candidates,
+                    strict_change=strict_change_for_unchanged_retry,
+                )
+            )
 
             for orig, initial_issue, initial_message, complexity, segment_type in retry_candidates:
                 retry_fixed = retry_results.get(orig, orig)
@@ -1210,6 +1216,11 @@ def main() -> None:
     skip_units = st.checkbox("Jednotky neměnit", value=True)
     keep_unsafe = st.checkbox("Keep translated anyway (unsafe)", value=False)
     revalidate_cache_hits_quality_gate = st.checkbox("Revalidovat cache hity quality gate", value=True)
+    strict_change_for_unchanged_retry = st.checkbox(
+        "Vynutit změnu při unchanged retry (strict prompt)",
+        value=True,
+        help="Když je vypnuto, retry pro unchanged_text používá stejný prompt jako běžný překlad.",
+    )
     glossary_json = st.text_area("Glossary JSON", value='{}')
 
     col_start, col_pause, col_resume, col_stop = st.columns(4)
@@ -1254,6 +1265,7 @@ def main() -> None:
             "max_parallel_requests": int(max_parallel_requests),
             "keep_unsafe": keep_unsafe,
             "revalidate_cache_hits_quality_gate": revalidate_cache_hits_quality_gate,
+            "strict_change_for_unchanged_retry": strict_change_for_unchanged_retry,
             "glossary": glossary,
             "per_run_cells": int(per_run_cells),
             "translation_options": {
