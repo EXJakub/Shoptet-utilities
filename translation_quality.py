@@ -39,6 +39,34 @@ SLOVAK_HINTS = {
 CZECH_DIACRITICS = set("ěščřžýáíéťďňů")
 SLOVAK_DIACRITICS = set("áäčďéíĺľňóôŕšťúýž")
 
+CZ_SK_LEXEME_RULES: tuple[tuple[re.Pattern[str], re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\bzp[eě]tn(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)?\b", re.IGNORECASE),
+        re.compile(r"\bsp[aä]tn(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)?\b", re.IGNORECASE),
+        "zpětný->spätný",
+    ),
+    (
+        re.compile(r"\bzved[aá]k(?:y|u|em|ům|ama|ách)?\b", re.IGNORECASE),
+        re.compile(r"\bzdvih[aá]k(?:y|u|om|mi|och)?\b", re.IGNORECASE),
+        "zvedák->zdvihák",
+    ),
+    (
+        re.compile(r"\b(?:čern|cern)(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)\b", re.IGNORECASE),
+        re.compile(r"\bčiern(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)\b", re.IGNORECASE),
+        "černý->čierny",
+    ),
+    (
+        re.compile(r"\b(?:šed|sed)(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)\b", re.IGNORECASE),
+        re.compile(r"\bsiv(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)\b", re.IGNORECASE),
+        "šedý->sivý",
+    ),
+    (
+        re.compile(r"\b(?:bíl|bil)(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)\b", re.IGNORECASE),
+        re.compile(r"\bbiel(?:[ýyáaéeíi]|[ýy]ch|[ýy]mi)\b", re.IGNORECASE),
+        "bílý->biely",
+    ),
+)
+
 
 @dataclass(slots=True)
 class QualityCheckResult:
@@ -53,6 +81,16 @@ def _normalize(text: str) -> str:
 
 def _alpha_len(text: str) -> int:
     return sum(1 for ch in text if LETTER_RE.match(ch))
+
+
+def _residual_czech_lexemes(source: str, translated: str) -> list[str]:
+    source_plain = PLACEHOLDER_RE.sub(" ", source)
+    translated_plain = PLACEHOLDER_RE.sub(" ", translated)
+    hits: list[str] = []
+    for cz_re, sk_re, label in CZ_SK_LEXEME_RULES:
+        if cz_re.search(source_plain) and cz_re.search(translated_plain) and not sk_re.search(translated_plain):
+            hits.append(label)
+    return hits
 
 
 def is_legit_unchanged(source: str, translated: str) -> bool:
@@ -77,6 +115,12 @@ def is_legit_unchanged(source: str, translated: str) -> bool:
     if words and len(words) <= 2 and alpha_len <= 18:
         # Short brand-like labels often legitimately stay unchanged in CZ/SK.
         if all(w.isupper() or w[:1].isupper() or any(ch.isdigit() for ch in w) for w in words):
+            return True
+    if words and len(words) <= 2 and 3 <= alpha_len <= 12:
+        # CZ/SK share many short technical and catalog words (e.g. "adaptér", "black").
+        # Keep the rule conservative: no Czech-specific hints and no punctuation-heavy strings.
+        token_set = {w.lower() for w in words}
+        if not token_set.intersection(CZECH_HINTS) and plain.replace(" ", "").isalnum():
             return True
     return False
 
@@ -111,6 +155,15 @@ def assess_translation_quality(
     unchanged_min = 6 if risk_tier == "strict" else 12
     if src_norm == tr_norm and _alpha_len(source) >= unchanged_min and not is_legit_unchanged(source, translated):
         return QualityCheckResult(ok=False, code="unchanged_text", message="Long text is unchanged in CS→SK translation.")
+
+    residual_lexemes = _residual_czech_lexemes(source, translated)
+    if residual_lexemes:
+        detail = ", ".join(residual_lexemes[:3])
+        return QualityCheckResult(
+            ok=False,
+            code="czech_lexeme_residual",
+            message=f"Translated text still contains Czech lexemes with Slovak equivalents ({detail}).",
+        )
 
     if risk_tier == "fast":
         return QualityCheckResult(ok=True, code="ok", message="ok")

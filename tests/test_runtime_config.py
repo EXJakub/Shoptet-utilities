@@ -23,6 +23,7 @@ def test_runtime_config_uses_safe_defaults(monkeypatch) -> None:
     assert cfg.batch_autotune_cooldown_batches == 2
     assert cfg.batch_parallel_downshift_p95_ms == 8500
     assert cfg.batch_parallel_upshift_p95_ms == 3500
+    assert cfg.max_unchanged_retries_per_batch == 40
 
 
 def test_runtime_config_clamps_invalid_checkpoint_value(monkeypatch) -> None:
@@ -42,6 +43,7 @@ def test_runtime_config_clamps_new_autotune_and_sampling_settings(monkeypatch) -
     monkeypatch.setenv("BATCH_PARALLEL_UPSHIFT_P95_MS", "9000")
     monkeypatch.setenv("BATCH_CHUNK_DOWNSHIFT_AVG_LATENCY_MS", "800")
     monkeypatch.setenv("BATCH_CHUNK_UPSHIFT_AVG_LATENCY_MS", "12000")
+    monkeypatch.setenv("BATCH_MAX_UNCHANGED_RETRIES_PER_BATCH", "-10")
 
     cfg = load_runtime_config()
 
@@ -53,3 +55,4 @@ def test_runtime_config_clamps_new_autotune_and_sampling_settings(monkeypatch) -
     assert cfg.batch_parallel_upshift_p95_ms == 1000
     assert cfg.batch_chunk_downshift_avg_latency_ms == 1000
     assert cfg.batch_chunk_upshift_avg_latency_ms == 1000
+    assert cfg.max_unchanged_retries_per_batch == 0

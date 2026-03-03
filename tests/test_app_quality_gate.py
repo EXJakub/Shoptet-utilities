@@ -300,3 +300,35 @@ def test_autotune_parallelism_downshifts_on_persistent_quality_fail(monkeypatch)
 
     app._autotune_parallelism(_Provider())
     assert fake_st.session_state["job_adaptive_parallel_current"] == 8
+
+
+def test_finalize_stopped_job_writes_artifacts_and_emits_stopped_telemetry(monkeypatch) -> None:
+    fake_st = _FakeSt()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "TranslationCache", _FakeCache)
+
+    captured: dict[str, object] = {}
+
+    def _fake_write_job_artifacts(**kwargs):
+        captured.update(kwargs)
+
+    def _fake_emit_run_telemetry(phase: str) -> None:
+        captured["phase"] = phase
+
+    monkeypatch.setattr(app, "write_job_artifacts", _fake_write_job_artifacts)
+    monkeypatch.setattr(app, "_emit_run_telemetry", _fake_emit_run_telemetry)
+
+    fake_st.session_state.update(
+        {
+            "job_settings": {"source_mode": "CSV"},
+            "job_df_out": pd.DataFrame({"description": ["abc"]}),
+            "job_run_gate_passed": False,
+            "job_run_gate_reasons": ["quality_fail_ratio"],
+        }
+    )
+
+    app._finalize_stopped_job(pd.DataFrame({"description": ["abc"]}), CsvFormat(encoding="utf-8", delimiter=";", quotechar='"'))
+
+    assert captured.get("include_validation_bundle") is True
+    assert captured.get("phase") == "stopped"
+    assert fake_st.session_state.get("job_publish_blocked_reason") == "quality_fail_ratio"

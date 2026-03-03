@@ -30,3 +30,22 @@ def test_legit_unchanged_url_is_allowed() -> None:
 def test_long_natural_language_unchanged_is_not_legit() -> None:
     text = "Tento produkt je pouze skladem na centrálním skladu"
     assert is_legit_unchanged(text, text) is False
+
+
+def test_cs_sk_detects_residual_czech_lexeme_in_short_text() -> None:
+    out = assess_translation_quality("Zpětný ventil PVC-U", "Zpětný ventil pre bazén PVC-U", "cs", "sk", risk_tier="fast")
+    assert out.ok is False
+    assert out.code == "czech_lexeme_residual"
+
+
+def test_cs_sk_detects_residual_czech_lexeme_in_long_text() -> None:
+    source = "Černý kryt je určen pro bazén a zpětný ventil."
+    translated = "Černý kryt je určený pre bazén a spätný ventil."
+    out = assess_translation_quality(source, translated, "cs", "sk", risk_tier="strict")
+    assert out.ok is False
+    assert out.code == "czech_lexeme_residual"
+
+
+def test_cs_sk_accepts_lexeme_when_slovak_variant_used() -> None:
+    out = assess_translation_quality("Zvedák termokrytu", "Zdvihák termokrytu", "cs", "sk", risk_tier="fast")
+    assert out.ok is True
